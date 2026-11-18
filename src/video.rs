@@ -5,22 +5,30 @@ use std::sync::mpsc::SyncSender;
 use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, E_FAIL, HANDLE, HMODULE, HWND, POINT, RECT, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT};
 use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
 use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::Graphics::Gdi::{ClientToScreen, DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow};
+use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+use windows::Win32::Graphics::Gdi::{ClientToScreen, DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
 use windows::Win32::System::Threading::*;
-use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsIconic, IsWindow};
+use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
+use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Graphics::SizeInt32;
+use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
+use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, IsIconic, IsWindow};
 use windows::core::{Error, HSTRING, Interface, Result};
 
 use crate::cursor::CursorOverlay;
 use crate::encoder::{Frame, FramePool};
-use crate::programs::{self, Program};
-use crate::recorder::Clock;
+use crate::programs::Program;
+use crate::recorder::{Clock, in_mta};
 
 pub const PREVIEW_FPS: u32 = 30;
+const FRAME_BUFFERS: i32 = 2;
 const STARVED_SECONDS: i64 = 2;
 
 #[derive(Clone)]
@@ -92,19 +100,32 @@ pub fn monitors() -> Result<Vec<MonitorInfo>> {
 
 pub enum Source {
     Monitor(MonitorInfo),
-    Program(Program, MonitorInfo),
+    Program(Program),
+}
+
+enum Backend {
+    Monitor {
+        output:      IDXGIOutput1,
+        duplication: Option<IDXGIOutputDuplication>,
+        cursor:      Option<CursorOverlay>,
+        resize:      Option<Resize>,
+        desktop:     (u32, u32),
+    },
+    Program {
+        window:  HWND,
+        capture: WindowCapture,
+        content: SizeInt32,
+        scaler:  Scaler,
+    },
 }
 
 pub struct VideoCapture {
     device:      ID3D11Device,
     context:     ID3D11DeviceContext,
     multithread: ID3D10Multithread,
-    adapter:     IDXGIAdapter1,
-    screen:      Screen,
-    scaler:      Option<Scaler>,
-    window:      Option<HWND>,
-    cursor:      bool,
+    backend:     Backend,
     swapchain:   IDXGISwapChain1,
+    latest:      ID3D11Texture2D,
     width:       u32,
     height:      u32,
 }
@@ -112,30 +133,20 @@ pub struct VideoCapture {
 unsafe impl Send for VideoCapture {}
 
 impl VideoCapture {
-    pub fn open(source: &Source, output_height: Option<u32>, preview: HWND, cursor: bool) -> Result<Self> {
+    pub fn open(source: &Source, output: Option<u32>, preview: HWND, cursor: bool) -> Result<Self> {
         unsafe {
-            let (monitor, program) = match source {
-                Source::Monitor(monitor) => (monitor, None),
-                Source::Program(program, monitor) => (monitor, Some(program)),
-            };
             let factory: IDXGIFactory2 = CreateDXGIFactory1()?;
-            let adapter = factory.EnumAdapters1(monitor.adapter)?;
-            let (device, context) = create_device(&adapter)?;
+            let (device, context) = match source {
+                Source::Monitor(monitor) => create_device(Some(&factory.EnumAdapters1(monitor.adapter)?))?,
+                Source::Program(_) => create_device(None)?,
+            };
             let multithread: ID3D10Multithread = device.cast()?;
 
             _ = multithread.SetMultithreadProtected(true);
 
-            let desktop = (monitor.width, monitor.height);
-            let source_size = match program {
-                Some(program) => program_size(program)?,
-                None => desktop,
-            };
-            let (width, height) = output_size(source_size, output_height);
-            let scaled = program.is_some() || (width, height) != desktop;
-            let screen = Screen::open(&device, adapter.EnumOutputs(monitor.output)?.cast()?, cursor, scaled)?;
-            let scaler = match scaled {
-                true => Some(Scaler::new(&device)?),
-                false => None,
+            let (backend, latest, width, height) = match source {
+                Source::Monitor(monitor) => open_monitor(&factory, &device, monitor, output, cursor)?,
+                Source::Program(program) => open_program(&device, program, output, cursor)?,
             };
             let swapchain_desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
@@ -153,7 +164,7 @@ impl VideoCapture {
 
             factory.MakeWindowAssociation(preview, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES)?;
 
-            Ok(Self { device, context, multithread, adapter, screen, scaler, window: program.map(Program::hwnd), cursor, swapchain, width, height })
+            Ok(Self { device, context, multithread, backend, swapchain, latest, width, height })
         }
     }
 
@@ -237,75 +248,93 @@ impl VideoCapture {
     }
 
     fn acquire(&mut self) -> Result<bool> {
-        unsafe {
-            if let Some(window) = self.window {
-                if !IsWindow(Some(window)).as_bool() {
+        match &mut self.backend {
+            Backend::Monitor { output, duplication, cursor, desktop, .. } => unsafe {
+                if duplication.is_none() {
+                    match output.DuplicateOutput(&self.device) {
+                        Ok(fresh) => {
+                            let mode = fresh.GetDesc().ModeDesc;
+
+                            if (mode.Width, mode.Height) != *desktop {
+                                return Err(Error::new(E_FAIL, "Monitor resolution changed during capture"));
+                            }
+
+                            *duplication = Some(fresh);
+                        }
+                        Err(e) if e.code() == E_ACCESSDENIED => return Ok(false),
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                let Some(active) = duplication.as_ref() else {
+                    return Ok(false);
+                };
+                let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+                let mut resource = None;
+
+                match active.AcquireNextFrame(0, &mut info, &mut resource) {
+                    Ok(()) => {
+                        let texture: ID3D11Texture2D = resource.ok_or_else(|| Error::new(E_FAIL, "AcquireNextFrame returned no resource"))?.cast()?;
+
+                        self.multithread.Enter();
+                        self.context.CopyResource(&self.latest, &texture);
+                        self.multithread.Leave();
+
+                        if let Some(cursor) = cursor {
+                            cursor.update(&self.device, active, &info)?;
+                        }
+
+                        active.ReleaseFrame()?;
+                        Ok(true)
+                    }
+                    Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => Ok(false),
+                    Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
+                        *duplication = None;
+                        Ok(false)
+                    }
+                    Err(e) => Err(e),
+                }
+            },
+            Backend::Program { window, capture, content, scaler } => unsafe {
+                if !IsWindow(Some(*window)).as_bool() {
                     return Err(Error::new(E_FAIL, "The program being captured was closed"));
                 }
 
-                self.follow(window)?;
-            }
-
-            let screen = &mut self.screen;
-
-            if screen.duplication.is_none() {
-                match screen.output.DuplicateOutput(&self.device) {
-                    Ok(fresh) => {
-                        let mode = fresh.GetDesc().ModeDesc;
-
-                        if (mode.Width, mode.Height) != screen.desktop {
-                            return Err(Error::new(E_FAIL, "Monitor resolution changed during capture"));
-                        }
-
-                        screen.duplication = Some(fresh);
-                    }
-                    Err(e) if e.code() == E_ACCESSDENIED => return Ok(false),
+                let frame = match capture.pool.TryGetNextFrame() {
+                    Ok(frame) => frame,
+                    Err(e) if e.code().is_ok() => return Ok(false),
                     Err(e) => return Err(e),
-                }
-            }
+                };
+                let size = frame.ContentSize()?;
+                let texture: ID3D11Texture2D = frame.Surface()?.cast::<IDirect3DDxgiInterfaceAccess>()?.GetInterface()?;
+                let mut surface = D3D11_TEXTURE2D_DESC::default();
 
-            let Some(active) = screen.duplication.as_ref() else {
-                return Ok(false);
-            };
-            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
-            let mut resource = None;
+                texture.GetDesc(&mut surface);
 
-            match active.AcquireNextFrame(0, &mut info, &mut resource) {
-                Ok(()) => {
-                    let texture: ID3D11Texture2D = resource.ok_or_else(|| Error::new(E_FAIL, "AcquireNextFrame returned no resource"))?.cast()?;
+                let visible = SizeInt32 { Width: size.Width.min(surface.Width as i32), Height: size.Height.min(surface.Height as i32) };
 
+                let crop = client_crop(*window, visible)?;
+
+                if let Some(crop) = crop {
                     self.multithread.Enter();
-                    self.context.CopyResource(&screen.latest, &texture);
+
+                    let drawn = scaler.draw(&texture, crop, &self.latest, self.width, self.height);
+
                     self.multithread.Leave();
-
-                    if let Some(cursor) = &mut screen.cursor {
-                        cursor.update(&self.device, active, &info)?;
-                    }
-
-                    active.ReleaseFrame()?;
-                    Ok(true)
+                    drawn?;
                 }
-                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => Ok(false),
-                Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
-                    screen.duplication = None;
-                    Ok(false)
+
+                drop(texture);
+                frame.Close()?;
+
+                if size != *content && size.Width > 0 && size.Height > 0 {
+                    capture.pool.Recreate(&*capture.device, DirectXPixelFormat::B8G8R8A8UIntNormalized, FRAME_BUFFERS, size)?;
+                    *content = size;
                 }
-                Err(e) => Err(e),
-            }
+
+                Ok(crop.is_some())
+            },
         }
-    }
-
-    fn follow(&mut self, window: HWND) -> Result<()> {
-        let monitor = unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) };
-
-        if monitor == self.screen.monitor {
-            return Ok(());
-        }
-
-        let output = find_output(&self.adapter, monitor)?;
-
-        self.screen = Screen::open(&self.device, output, self.cursor, self.scaler.is_some())?;
-        Ok(())
     }
 
     fn render(&self, target: Option<&ID3D11Texture2D>, present: bool) -> Result<()> {
@@ -351,127 +380,39 @@ impl VideoCapture {
 
     unsafe fn compose(&self, texture: &ID3D11Texture2D) -> Result<()> {
         unsafe {
-            let screen = &self.screen;
-            let canvas = screen.canvas.as_ref().unwrap_or(texture);
+            match &self.backend {
+                Backend::Monitor { cursor, resize, .. } => {
+                    let canvas = resize.as_ref().map_or(texture, |resize| &resize.canvas);
 
-            self.context.CopyResource(canvas, &screen.latest);
+                    self.context.CopyResource(canvas, &self.latest);
 
-            if let Some(cursor) = &screen.cursor {
-                cursor.draw(&self.device, &self.context, canvas)?;
-            }
+                    if let Some(cursor) = cursor {
+                        cursor.draw(&self.device, &self.context, canvas)?;
+                    }
 
-            if let Some(scaler) = &self.scaler {
-                scaler.draw(canvas, self.area()?, texture, self.width, self.height)?;
+                    if let Some(resize) = resize {
+                        resize.scaler.draw(&resize.canvas, resize.area, texture, self.width, self.height)?;
+                    }
+                }
+                Backend::Program { .. } => self.context.CopyResource(texture, &self.latest),
             }
 
             Ok(())
         }
     }
-
-    fn area(&self) -> Result<Option<D2D_RECT_F>> {
-        let (width, height) = (self.screen.desktop.0 as i32, self.screen.desktop.1 as i32);
-        let Some(window) = self.window else {
-            return Ok(Some(D2D_RECT_F { left: 0.0, top: 0.0, right: width as f32, bottom: height as f32 }));
-        };
-
-        unsafe {
-            if IsIconic(window).as_bool() {
-                return Ok(None);
-            }
-
-            let (mut client, mut corner) = (RECT::default(), POINT::default());
-
-            GetClientRect(window, &mut client)?;
-            ClientToScreen(window, &mut corner).ok()?;
-
-            let (x, y) = (corner.x - self.screen.origin.x, corner.y - self.screen.origin.y);
-            let (left, top) = (x.clamp(0, width), y.clamp(0, height));
-            let (right, bottom) = ((x + client.right).clamp(0, width), (y + client.bottom).clamp(0, height));
-
-            if right - left < 2 || bottom - top < 2 {
-                return Ok(None);
-            }
-
-            Ok(Some(D2D_RECT_F { left: left as f32, top: top as f32, right: right as f32, bottom: bottom as f32 }))
-        }
-    }
 }
 
-struct Screen {
-    output:      IDXGIOutput1,
-    duplication: Option<IDXGIOutputDuplication>,
-    monitor:     HMONITOR,
-    origin:      POINT,
-    desktop:     (u32, u32),
-    latest:      ID3D11Texture2D,
-    canvas:      Option<ID3D11Texture2D>,
-    cursor:      Option<CursorOverlay>,
-}
-
-impl Screen {
-    fn open(device: &ID3D11Device, output: IDXGIOutput1, cursor: bool, canvas: bool) -> Result<Self> {
-        unsafe {
-            let desc = output.GetDesc()?;
-
-            if desc.Rotation != DXGI_MODE_ROTATION_IDENTITY && desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED {
-                return Err(Error::new(E_FAIL, "Rotated monitors are not supported"));
-            }
-
-            let duplication = output.DuplicateOutput(device)?;
-            let mode = duplication.GetDesc().ModeDesc;
-
-            if mode.Width % 2 != 0 || mode.Height % 2 != 0 {
-                return Err(Error::new(E_FAIL, format!("Monitor resolution {}x{} must have even dimensions for H.264", mode.Width, mode.Height)));
-            }
-
-            let latest = create_texture(device, mode.Width, mode.Height)?;
-            let cursor = match cursor {
-                true => Some(CursorOverlay::new(device, &latest, mode.Width, mode.Height)?),
-                false => None,
-            };
-            let canvas = match canvas {
-                true => Some(create_texture(device, mode.Width, mode.Height)?),
-                false => None,
-            };
-
-            Ok(Self {
-                output,
-                duplication: Some(duplication),
-                monitor: desc.Monitor,
-                origin: POINT { x: desc.DesktopCoordinates.left, y: desc.DesktopCoordinates.top },
-                desktop: (mode.Width, mode.Height),
-                latest,
-                canvas,
-                cursor,
-            })
-        }
-    }
-}
-
-fn find_output(adapter: &IDXGIAdapter1, monitor: HMONITOR) -> Result<IDXGIOutput1> {
-    for index in 0.. {
-        let output = match unsafe { adapter.EnumOutputs(index) } {
-            Ok(output) => output,
-            Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
-            Err(e) => return Err(e),
-        };
-
-        if unsafe { output.GetDesc()? }.Monitor == monitor {
-            return output.cast();
-        }
-    }
-
-    Err(Error::new(E_FAIL, "The program moved to a monitor on another graphics card, which MiniRec cannot follow"))
-}
-
-unsafe fn create_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+unsafe fn create_device(adapter: Option<&IDXGIAdapter1>) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     unsafe {
         let mut device = None;
         let mut context = None;
+        let driver = if adapter.is_some() { D3D_DRIVER_TYPE_UNKNOWN } else { D3D_DRIVER_TYPE_HARDWARE };
+
+        let adapter: Option<IDXGIAdapter> = adapter.map(Interface::cast).transpose()?;
 
         D3D11CreateDevice(
-            &adapter.cast::<IDXGIAdapter>()?,
-            D3D_DRIVER_TYPE_UNKNOWN,
+            adapter.as_ref(),
+            driver,
             HMODULE::default(),
             D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
             None,
@@ -488,29 +429,108 @@ unsafe fn create_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11
     }
 }
 
-fn program_size(program: &Program) -> Result<(u32, u32)> {
+unsafe fn open_monitor(factory: &IDXGIFactory2, device: &ID3D11Device, monitor: &MonitorInfo, output_height: Option<u32>, cursor: bool) -> Result<(Backend, ID3D11Texture2D, u32, u32)> {
+    unsafe {
+        let output: IDXGIOutput1 = factory.EnumAdapters1(monitor.adapter)?.EnumOutputs(monitor.output)?.cast()?;
+        let desc = output.GetDesc()?;
+
+        if desc.Rotation != DXGI_MODE_ROTATION_IDENTITY && desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED {
+            return Err(Error::new(E_FAIL, "Rotated monitors are not supported"));
+        }
+
+        let duplication = output.DuplicateOutput(device)?;
+        let mode = duplication.GetDesc().ModeDesc;
+
+        if mode.Width % 2 != 0 || mode.Height % 2 != 0 {
+            return Err(Error::new(E_FAIL, format!("Monitor resolution {}x{} must have even dimensions for H.264", mode.Width, mode.Height)));
+        }
+
+        let latest = create_texture(device, mode.Width, mode.Height)?;
+        let cursor = match cursor {
+            true => Some(CursorOverlay::new(device, &latest, mode.Width, mode.Height)?),
+            false => None,
+        };
+
+        let (width, height) = output_size((mode.Width, mode.Height), output_height);
+        let resize = match (width, height) == (mode.Width, mode.Height) {
+            true => None,
+            false => Some(Resize {
+                canvas: create_texture(device, mode.Width, mode.Height)?,
+                scaler: Scaler::new(device)?,
+                area: D2D_RECT_F { left: 0.0, top: 0.0, right: mode.Width as f32, bottom: mode.Height as f32 },
+            }),
+        };
+
+        Ok((Backend::Monitor { output, duplication: Some(duplication), cursor, resize, desktop: (mode.Width, mode.Height) }, latest, width, height))
+    }
+}
+
+unsafe fn open_program(device: &ID3D11Device, program: &Program, output_height: Option<u32>, cursor: bool) -> Result<(Backend, ID3D11Texture2D, u32, u32)> {
+    if !GraphicsCaptureSession::IsSupported()? {
+        return Err(Error::new(E_FAIL, "Window capture is not supported on this version of Windows"));
+    }
+
+    let window = program.hwnd();
     let mut client = RECT::default();
 
-    unsafe { GetClientRect(program.hwnd(), &mut client)? };
+    unsafe { GetClientRect(window, &mut client)? };
 
-    let size = (client.right as u32 & !1, client.bottom as u32 & !1);
+    let client = (client.right as u32 & !1, client.bottom as u32 & !1);
 
-    if programs::minimized(program) || size.0 < 2 || size.1 < 2 {
+    if unsafe { IsIconic(window) }.as_bool() || client.0 < 2 || client.1 < 2 {
         return Err(Error::new(E_FAIL, format!("{} is minimized or too small to capture. Restore it and try again.", program.label())));
     }
 
-    Ok(size)
+    let shared = Movable(device.clone());
+    let target = program.clone();
+    let Movable((capture, size)) = in_mta(move || unsafe {
+        let Movable(device) = shared;
+        let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+        let item: GraphicsCaptureItem = interop.CreateForWindow(target.hwnd()).map_err(|e| Error::new(e.code(), format!("Cannot capture {}: {}", target.label(), e.message())))?;
+        let size = item.Size()?;
+        let winrt_device: IDirect3DDevice = CreateDirect3D11DeviceFromDXGIDevice(&device.cast::<IDXGIDevice>()?)?.cast()?;
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&winrt_device, DirectXPixelFormat::B8G8R8A8UIntNormalized, FRAME_BUFFERS, size)?;
+        let session = pool.CreateCaptureSession(&item)?;
+        let capture = WindowCapture { pool: ManuallyDrop::new(pool), session: ManuallyDrop::new(session), device: ManuallyDrop::new(winrt_device) };
+
+        capture.session.SetIsCursorCaptureEnabled(cursor)?;
+        capture.session.StartCapture()?;
+        Ok(Movable((capture, size)))
+    })?;
+    let (width, height) = output_size(client, output_height);
+    let latest = create_texture(device, width, height)?;
+    let scaler = Scaler::new(device)?;
+
+    Ok((Backend::Program { window, capture, content: size, scaler }, latest, width, height))
 }
 
-pub fn monitor_of(window: HWND, monitors: &[MonitorInfo]) -> Result<MonitorInfo> {
+fn client_crop(window: HWND, frame: SizeInt32) -> Result<Option<D2D_RECT_F>> {
     unsafe {
-        let mut info = MONITORINFOEXW { monitorInfo: MONITORINFO { cbSize: size_of::<MONITORINFOEXW>() as u32, ..Default::default() }, ..Default::default() };
+        if IsIconic(window).as_bool() {
+            return Ok(None);
+        }
 
-        GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mut info.monitorInfo).ok()?;
+        let (mut outer, mut bounds, mut client, mut origin) = (RECT::default(), RECT::default(), RECT::default(), POINT::default());
 
-        let name = String::from_utf16_lossy(&info.szDevice).trim_end_matches('\0').trim_start_matches(r"\\.\").to_string();
+        GetWindowRect(window, &mut outer)?;
+        DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &mut bounds as *mut RECT as *mut _, size_of::<RECT>() as u32)?;
+        GetClientRect(window, &mut client)?;
+        ClientToScreen(window, &mut origin).ok()?;
 
-        monitors.iter().find(|monitor| monitor.name == name).cloned().ok_or_else(|| Error::new(E_FAIL, format!("The window is on {name}, which is not an active monitor")))
+        let frame_origin = match outer.right - outer.left == frame.Width && outer.bottom - outer.top == frame.Height {
+            true => (outer.left, outer.top),
+            false => (bounds.left, bounds.top),
+        };
+        let left = (origin.x - frame_origin.0).clamp(0, frame.Width);
+        let top = (origin.y - frame_origin.1).clamp(0, frame.Height);
+        let right = (left + client.right).min(frame.Width);
+        let bottom = (top + client.bottom).min(frame.Height);
+
+        if right - left < 2 || bottom - top < 2 {
+            return Ok(None);
+        }
+
+        Ok(Some(D2D_RECT_F { left: left as f32, top: top as f32, right: right as f32, bottom: bottom as f32 }))
     }
 }
 
@@ -520,6 +540,12 @@ pub fn output_size(source: (u32, u32), output_height: Option<u32>) -> (u32, u32)
 
 pub fn fixed_size(height: u32) -> (u32, u32) {
     ((height * 16 / 9 + 1) & !1, height)
+}
+
+struct Resize {
+    canvas: ID3D11Texture2D,
+    scaler: Scaler,
+    area:   D2D_RECT_F,
 }
 
 struct Scaler {
@@ -536,20 +562,28 @@ impl Scaler {
         }
     }
 
-    unsafe fn draw(&self, texture: &ID3D11Texture2D, crop: Option<D2D_RECT_F>, target: &ID3D11Texture2D, width: u32, height: u32) -> Result<()> {
+    unsafe fn draw(&self, texture: &ID3D11Texture2D, crop: D2D_RECT_F, target: &ID3D11Texture2D, width: u32, height: u32) -> Result<()> {
         unsafe {
+            let source = self.context.CreateBitmapFromDxgiSurface(&texture.cast::<IDXGISurface>()?, Some(&bitmap_properties(D2D1_BITMAP_OPTIONS_NONE)))?;
             let output = self.context.CreateBitmapFromDxgiSurface(&target.cast::<IDXGISurface>()?, Some(&bitmap_properties(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW)))?;
+            let (width, height) = (width as f32, height as f32);
+            let (crop_width, crop_height) = (crop.right - crop.left, crop.bottom - crop.top);
+            let fits = (width..=width + 1.0).contains(&crop_width) && (height..=height + 1.0).contains(&crop_height);
+            let (crop, destination) = match fits {
+                true => (D2D_RECT_F { right: crop.left + width, bottom: crop.top + height, ..crop }, D2D_RECT_F { left: 0.0, top: 0.0, right: width, bottom: height }),
+                false => {
+                    let scale = (width / crop_width).min(height / crop_height);
+                    let (scaled_width, scaled_height) = (crop_width * scale, crop_height * scale);
+                    let (left, top) = (((width - scaled_width) / 2.0).round(), ((height - scaled_height) / 2.0).round());
+
+                    (crop, D2D_RECT_F { left, top, right: left + scaled_width, bottom: top + scaled_height })
+                }
+            };
 
             self.context.SetTarget(&output);
             self.context.BeginDraw();
             self.context.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }));
-
-            if let Some(crop) = crop {
-                let source = self.context.CreateBitmapFromDxgiSurface(&texture.cast::<IDXGISurface>()?, Some(&bitmap_properties(D2D1_BITMAP_OPTIONS_NONE)))?;
-                let (crop, destination) = fit(crop, width as f32, height as f32);
-
-                self.context.DrawBitmap(&source, Some(&destination), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, Some(&crop), None);
-            }
+            self.context.DrawBitmap(&source, Some(&destination), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, Some(&crop), None);
 
             let drawn = self.context.EndDraw(None, None);
 
@@ -559,20 +593,6 @@ impl Scaler {
     }
 }
 
-fn fit(crop: D2D_RECT_F, width: f32, height: f32) -> (D2D_RECT_F, D2D_RECT_F) {
-    let (crop_width, crop_height) = (crop.right - crop.left, crop.bottom - crop.top);
-
-    if (width..=width + 1.0).contains(&crop_width) && (height..=height + 1.0).contains(&crop_height) {
-        return (D2D_RECT_F { right: crop.left + width, bottom: crop.top + height, ..crop }, D2D_RECT_F { left: 0.0, top: 0.0, right: width, bottom: height });
-    }
-
-    let scale = (width / crop_width).min(height / crop_height);
-    let (scaled_width, scaled_height) = (crop_width * scale, crop_height * scale);
-    let (left, top) = (((width - scaled_width) / 2.0).round(), ((height - scaled_height) / 2.0).round());
-
-    (crop, D2D_RECT_F { left, top, right: left + scaled_width, bottom: top + scaled_height })
-}
-
 fn bitmap_properties(options: D2D1_BITMAP_OPTIONS) -> D2D1_BITMAP_PROPERTIES1 {
     D2D1_BITMAP_PROPERTIES1 {
         pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE },
@@ -580,6 +600,23 @@ fn bitmap_properties(options: D2D1_BITMAP_OPTIONS) -> D2D1_BITMAP_PROPERTIES1 {
         dpiY: 96.0,
         bitmapOptions: options,
         colorContext: ManuallyDrop::new(None),
+    }
+}
+
+struct WindowCapture {
+    pool:    ManuallyDrop<Direct3D11CaptureFramePool>,
+    session: ManuallyDrop<GraphicsCaptureSession>,
+    device:  ManuallyDrop<IDirect3DDevice>,
+}
+
+impl Drop for WindowCapture {
+    fn drop(&mut self) {
+        let objects = Movable(unsafe { (ManuallyDrop::take(&mut self.session), ManuallyDrop::take(&mut self.pool), ManuallyDrop::take(&mut self.device)) });
+
+        _ = in_mta(move || {
+            drop(objects);
+            Ok(())
+        });
     }
 }
 

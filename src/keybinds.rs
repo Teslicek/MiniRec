@@ -11,7 +11,7 @@ use windows::core::{Error, PCWSTR, Result, w};
 
 use crate::draw::*;
 use crate::hotkeys::{Action, Bindings, Hotkey};
-use crate::shell::{WM_MOUSELEAVE, prepare_window, error_box, fit_client, high_word, low_word, mouse_point};
+use crate::shell::{WM_MOUSELEAVE, dark_title, error_box, fit_client, high_word, low_word, mouse_point};
 
 const CLASS: PCWSTR = w!("MiniRecKeybinds");
 const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0);
@@ -82,7 +82,7 @@ pub fn open(bindings: Bindings, callbacks: Callbacks) -> Result<()> {
 
         let window = CreateWindowExW(WINDOW_EX_STYLE(0), CLASS, w!("MiniRec Keybinds"), STYLE, CW_USEDEFAULT, CW_USEDEFAULT, 600, 450, None, None, Some(instance), None)?;
 
-        prepare_window(window)?;
+        dark_title(window)?;
 
         let dpi = GetDpiForWindow(window);
 

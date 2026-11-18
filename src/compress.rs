@@ -15,7 +15,7 @@ use crate::draw::*;
 use crate::edit::{InlineEdit, WM_EDIT_DONE, edit_colors};
 use crate::export::{Job, Plan, Probe, Target, WM_ESTIMATE_DONE, WM_EXPORT_DONE, is_cancelled, output_path, probe};
 use crate::settings::{CompressSettings, QUALITY_PRESETS, SIZE_PRESETS};
-use crate::shell::{WM_MOUSELEAVE, prepare_window, error_box, fit_client, high_word, low_word, mouse_point, pick_video, popup_menu, recycle, reveal};
+use crate::shell::{WM_MOUSELEAVE, dark_title, error_box, fit_client, high_word, low_word, mouse_point, pick_video, popup_menu, recycle, reveal};
 use crate::units::{format_bitrate, format_bytes, format_megabytes, format_time, parse_quality, parse_size};
 
 const CLASS: PCWSTR = w!("MiniRecCompress");
@@ -116,7 +116,7 @@ pub fn open(folder: &Path, choices: CompressSettings, remember: fn(CompressSetti
 
         let window = CreateWindowExW(WINDOW_EX_STYLE(0), CLASS, w!("MiniRec Compress"), STYLE, CW_USEDEFAULT, CW_USEDEFAULT, 700, 420, None, None, Some(instance), None)?;
 
-        prepare_window(window)?;
+        dark_title(window)?;
 
         let dpi = GetDpiForWindow(window);
 
