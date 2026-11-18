@@ -17,6 +17,7 @@ mod recorder;
 mod replay;
 mod settings;
 mod shell;
+mod startup;
 mod trim;
 mod ui;
 mod units;
@@ -34,7 +35,7 @@ use windows::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLACK_
 use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFShutdown, MFStartup};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoIncrementMTAUsage, CoInitializeEx};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize, WaitForSingleObject};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::Shell::*;
@@ -61,6 +62,9 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_SHOW_APP: u32 = WM_APP + 4;
 const WM_CLIP_SAVED: u32 = WM_APP + 5;
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
+const NIN_BALLOONHIDE: u32 = WM_USER + 3;
+const NIN_BALLOONTIMEOUT: u32 = WM_USER + 4;
+const NIN_BALLOONUSERCLICK: u32 = WM_USER + 5;
 const TIMER_ID: usize = 1;
 const MENU_SHOW: usize = 1;
 const MENU_TOGGLE: usize = 2;
@@ -69,6 +73,7 @@ const MENU_FOLDER: usize = 4;
 const MENU_EXIT: usize = 5;
 const MENU_CLIP: usize = 6;
 const MENU_COMPRESS: usize = 7;
+const MENU_STARTUP: usize = 8;
 const APP_ICON: PCWSTR = PCWSTR(1 as *const u16);
 const RECORDING_ICON_SIZE: u32 = 32;
 
@@ -127,6 +132,8 @@ struct App {
     program_note:   Option<String>,
     show_preview:   Arc<AtomicBool>,
     tray_icon:      HICON,
+    tray_shown:     bool,
+    balloon_open:   bool,
     recording_icon: HICON,
     hand_cursor:    HCURSOR,
     last_file:      Option<PathBuf>,
@@ -300,6 +307,7 @@ impl App {
 
                 self.session = Some(session);
                 self.place_preview()?;
+                tray_sync(self)?;
 
                 if missing_mic {
                     tray_balloon(self, "No microphone found", "Capturing without microphone audio.")?;
@@ -321,6 +329,7 @@ impl App {
         }
 
         self.update_timer()?;
+        tray_sync(self)?;
         self.sync_preview()
     }
 
@@ -403,6 +412,7 @@ fn run() -> Result<()> {
 
         match WaitForSingleObject(mutex, 0) {
             WAIT_OBJECT_0 | WAIT_ABANDONED => {}
+            WAIT_TIMEOUT if startup::started_in_background() => return Ok(()),
             WAIT_TIMEOUT => return show_running_instance(),
             _ => return Err(Error::from_win32()),
         }
@@ -482,6 +492,8 @@ fn create_and_run() -> Result<()> {
             program_note: None,
             show_preview: Arc::new(AtomicBool::new(false)),
             tray_icon: HICON(LoadImageW(Some(instance), APP_ICON, IMAGE_ICON, tray_size, tray_size, LR_DEFAULTCOLOR)?.0),
+            tray_shown: false,
+            balloon_open: false,
             recording_icon: create_icon(RECORDING_ICON_SIZE, &icon_pixels(RECORDING_ICON_SIZE, true))?,
             hand_cursor: LoadCursorW(None, IDC_HAND)?,
             last_file: None,
@@ -492,12 +504,21 @@ fn create_and_run() -> Result<()> {
             edit: None,
         };
 
-        tray_add(&app)?;
         APP.set(Some(app));
         fit_client(window, dpi, WIDTH, HEIGHT, MAIN_STYLE)?;
         place_preview()?;
-        show_window(window)?;
+
+        let background = startup::started_in_background();
+
+        if !background {
+            show_window(window)?;
+        }
+
         with_app(|app| app.sync_session())?;
+
+        if background {
+            trim_memory()?;
+        }
 
         if !hotkey_failures.is_empty() {
             error_box(Some(window), &Error::new(E_FAIL, format!("These shortcuts are used by another app and were not set:\n{}\n\nChange them in Keybinds.", hotkey_failures.join("\n"))));
@@ -644,7 +665,7 @@ fn handle(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Result<
                 activate(window, element)?;
             }
         }
-        WM_CLOSE => exit(window)?,
+        WM_CLOSE => hide_window(window)?,
         WM_TRAY => on_tray(window, lparam)?,
         WM_HOTKEY => match Action::from_id(wparam.0 as i32) {
             Some(action) => run_action(window, action)?,
@@ -659,7 +680,7 @@ fn handle(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Result<
             }
         })?,
         WM_TIMER => with_app(|app| {
-            tray_update(app)?;
+            tray_sync(app)?;
             app.invalidate()
         })?,
         WM_SESSION_FAILED => with_app(session_failed)?,
@@ -675,7 +696,10 @@ fn handle(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Result<
         })?,
         WM_SHOW_APP => show_window(window)?,
         WM_DESTROY => unsafe { PostQuitMessage(0) },
-        m if m == TASKBAR_CREATED.get() => with_app(|app| tray_add(app))?,
+        m if m == TASKBAR_CREATED.get() => with_app(|app| match app.tray_shown {
+            true => tray_add(app),
+            false => Ok(()),
+        })?,
         _ => return Ok(None),
     }
 
@@ -954,7 +978,7 @@ fn start_recording(app: &mut App) -> Result<()> {
 
     app.session.as_ref().ok_or_else(|| Error::new(E_FAIL, "Capture did not start"))?.begin_recording(recording_path(&app.settings.folder, ""))?;
     app.update_timer()?;
-    tray_update(app)?;
+    tray_sync(app)?;
     app.invalidate()
 }
 
@@ -965,17 +989,19 @@ fn stop_recording(app: &mut App) -> Result<()> {
 
     let saved = app.session.as_ref().ok_or_else(|| Error::new(E_FAIL, "Capture is not running"))?.end_recording();
 
-    tray_update(app)?;
     app.invalidate()?;
-    app.sync_session()?;
 
-    match saved? {
-        Some(path) => {
+    match &saved {
+        Ok(Some(path)) => {
             app.last_file = Some(path.clone());
-            tray_balloon(app, "Recording saved", &format!("{}\nClick to show in folder.", file_name(&path)?))
+            tray_balloon(app, "Recording saved", &format!("{}\nClick to show in folder.", file_name(path)?))?;
         }
-        None => tray_balloon(app, "Nothing recorded", "The recording was stopped before its first frame was ready."),
+        Ok(None) => tray_balloon(app, "Nothing recorded", "The recording was stopped before its first frame was ready.")?,
+        Err(_) => {}
     }
+
+    app.sync_session()?;
+    saved.map(|_| ())
 }
 
 fn session_failed(app: &mut App) -> Result<()> {
@@ -994,7 +1020,7 @@ fn session_failed(app: &mut App) -> Result<()> {
         app.save_settings()?;
     }
 
-    tray_update(app)?;
+    tray_sync(app)?;
     app.update_timer()?;
     app.sync_preview()?;
 
@@ -1084,7 +1110,7 @@ fn apply_hotkey(action: Action, hotkey: Option<Hotkey>) -> Result<Bindings> {
 
         app.settings.hotkeys[action.index()] = hotkey;
         app.save_settings()?;
-        tray_update(app)?;
+        tray_sync(app)?;
         Ok(app.settings.hotkeys)
     })
 }
@@ -1130,8 +1156,25 @@ fn show_window(window: HWND) -> Result<()> {
 
     with_app(|app| {
         app.refresh_devices()?;
-        app.sync_preview()
+        app.sync_preview()?;
+        tray_sync(app)
     })
+}
+
+fn hide_window(window: HWND) -> Result<()> {
+    finish_edit(false)?;
+    unsafe { _ = ShowWindow(window, SW_HIDE) };
+
+    with_app(|app| {
+        app.hover = None;
+        app.sync_preview()?;
+        app.canvas.release();
+        tray_sync(app)
+    })
+}
+
+fn trim_memory() -> Result<()> {
+    unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) }
 }
 
 fn exit(window: HWND) -> Result<()> {
@@ -1142,7 +1185,10 @@ fn exit(window: HWND) -> Result<()> {
         let session = app.session.take().map(Session::stop).transpose();
         let preview = app.preview.take().map(PreviewSession::stop).transpose();
 
-        tray_delete(app)?;
+        if app.tray_shown {
+            tray_delete(app)?;
+        }
+
         recording?;
         clip?;
         session?;
@@ -1172,17 +1218,29 @@ fn on_tray(window: HWND, lparam: LPARAM) -> Result<()> {
     match low_word(lparam.0) {
         NIN_SELECT | NIN_KEYSELECT => show_window(window),
         WM_CONTEXTMENU => tray_menu(window),
-        NIN_BALLOONUSERCLICK => match with_app(|app| Ok(app.last_file.clone()))? {
-            Some(path) => reveal(&path),
-            None => Ok(()),
-        },
+        NIN_BALLOONUSERCLICK => {
+            balloon_closed()?;
+
+            match with_app(|app| Ok(app.last_file.clone()))? {
+                Some(path) => reveal(&path),
+                None => Ok(()),
+            }
+        }
+        NIN_BALLOONHIDE | NIN_BALLOONTIMEOUT => balloon_closed(),
         _ => Ok(()),
     }
 }
 
+fn balloon_closed() -> Result<()> {
+    with_app(|app| {
+        app.balloon_open = false;
+        tray_sync(app)
+    })
+}
+
 fn tray_menu(window: HWND) -> Result<()> {
-    let recording = with_app(|app| Ok(app.recording.is_some()))?;
-    let (hotkeys, recording) = with_app(|app| Ok((app.settings.hotkeys, recording)))?;
+    let (hotkeys, recording) = with_app(|app| Ok((app.settings.hotkeys, app.recording.is_some())))?;
+    let starts_with_windows = startup::enabled()?;
     let shortcut = |action: Action| label_of(&hotkeys, action).map_or(String::new(), |hotkey| format!("\t{hotkey}"));
     let toggle_label = match recording {
         true => format!("Stop recording{}", shortcut(Action::Record)),
@@ -1200,6 +1258,7 @@ fn tray_menu(window: HWND) -> Result<()> {
         AppendMenuW(menu, MF_STRING, MENU_COMPRESS, w!("Compress a video"))?;
         AppendMenuW(menu, MF_STRING, MENU_FOLDER, w!("Open recordings folder"))?;
         AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())?;
+        AppendMenuW(menu, MF_STRING | if starts_with_windows { MF_CHECKED } else { MF_UNCHECKED }, MENU_STARTUP, w!("Start with Windows"))?;
         AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit"))?;
         GetCursorPos(&mut point)?;
         _ = SetForegroundWindow(window);
@@ -1216,6 +1275,7 @@ fn tray_menu(window: HWND) -> Result<()> {
             MENU_TRIM => trim::open(&with_app(|app| Ok(app.settings.folder.clone()))?),
             MENU_COMPRESS => open_compressor(),
             MENU_FOLDER => open_folder(&with_app(|app| Ok(app.settings.folder.clone()))?),
+            MENU_STARTUP => startup::set(!starts_with_windows),
             MENU_EXIT => exit(window),
             id => Err(Error::new(E_FAIL, format!("Unknown menu command {id}"))),
         }
@@ -1262,6 +1322,24 @@ fn tray_status(app: &App, data: &mut NOTIFYICONDATAW) {
     copy_wide(&mut data.szTip, &tip);
 }
 
+fn tray_sync(app: &mut App) -> Result<()> {
+    let visible = unsafe { IsWindowVisible(app.window).as_bool() };
+    let wanted = visible || app.session.is_some() || app.clip_job.is_some() || app.balloon_open;
+
+    match (wanted, app.tray_shown) {
+        (true, false) => tray_add(app)?,
+        (true, true) => tray_update(app)?,
+        (false, true) => {
+            tray_delete(app)?;
+            trim_memory()?;
+        }
+        (false, false) => {}
+    }
+
+    app.tray_shown = wanted;
+    Ok(())
+}
+
 fn tray_add(app: &App) -> Result<()> {
     let mut data = tray_data(app);
 
@@ -1280,7 +1358,10 @@ fn tray_update(app: &App) -> Result<()> {
     shell_notify(NIM_MODIFY, &data)
 }
 
-fn tray_balloon(app: &App, title: &str, text: &str) -> Result<()> {
+fn tray_balloon(app: &mut App, title: &str, text: &str) -> Result<()> {
+    app.balloon_open = true;
+    tray_sync(app)?;
+
     let mut data = tray_data(app);
 
     data.uFlags = NIF_INFO;

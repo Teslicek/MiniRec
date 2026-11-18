@@ -86,6 +86,10 @@ impl Canvas {
         }
     }
 
+    pub fn release(&self) {
+        self.target.replace(None);
+    }
+
     pub fn resize(&self, width: u32, height: u32) -> Result<()> {
         match &*self.target.borrow() {
             Some((target, _)) => unsafe { target.Resize(&D2D_SIZE_U { width, height }) },
