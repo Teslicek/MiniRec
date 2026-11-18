@@ -15,7 +15,7 @@ use crate::draw::*;
 use crate::edit::{InlineEdit, WM_EDIT_DONE, edit_colors};
 use crate::export::{Job, Mode, Plan, Scan, WM_EXPORT_DONE, WM_KEYFRAMES_DONE, is_cancelled, output_path, scan_keyframes, snap};
 use crate::player::{Player, PlayerEvent, WM_PLAYER_EVENT, decode_event};
-use crate::shell::{VIDEO_CLASS, WM_MOUSELEAVE, dark_title, error_box, fit_client, high_word, low_word, mouse_point, pick_video, place_child, reveal};
+use crate::shell::{VIDEO_CLASS, WM_MOUSELEAVE, prepare_window, error_box, fit_client, high_word, low_word, mouse_point, pick_video, place_child, reveal};
 use crate::units::{format_time, parse_time};
 
 const CLASS: windows::core::PCWSTR = w!("MiniRecTrim");
@@ -138,7 +138,7 @@ pub fn open(folder: &Path) -> Result<()> {
 
         let window = CreateWindowExW(WINDOW_EX_STYLE(0), CLASS, w!("MiniRec Trim"), STYLE, CW_USEDEFAULT, CW_USEDEFAULT, 900, 800, None, None, Some(instance), None)?;
 
-        dark_title(window)?;
+        prepare_window(window)?;
 
         let video = CreateWindowExW(WINDOW_EX_STYLE(0), VIDEO_CLASS, None, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, Some(window), None, Some(instance), None)?;
         let dpi = GetDpiForWindow(window);

@@ -139,10 +139,13 @@ pub fn fit_client(window: HWND, dpi: u32, width: f32, height: f32, style: WINDOW
     }
 }
 
-pub fn dark_title(window: HWND) -> Result<()> {
+pub fn prepare_window(window: HWND) -> Result<()> {
     let dark = BOOL(1);
 
-    unsafe { DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const BOOL as *const _, size_of::<BOOL>() as u32) }
+    unsafe {
+        DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const BOOL as *const _, size_of::<BOOL>() as u32)?;
+        SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE)
+    }
 }
 
 pub fn place_child(child: HWND, area: RECT) -> Result<()> {

@@ -4,7 +4,7 @@ A small, portable screen recorder for Windows, written in Rust. One exe of about
 
 ## Features
 
-- Record a whole monitor or a single program window (only the window's content, without its title bar)
+- Record a whole monitor or a single program window. Program capture records the window's area of the screen without its title bar and follows the window when it moves or resizes. Anything covering the window is recorded too, except MiniRec itself, which hides from all captures.
 - Output at source size or 2160p, 1440p, 1080p, 720p or 480p, with the picture scaled to fit
 - Hardware H.264 encoding through Media Foundation (NVIDIA, AMD or Intel)
 - System audio and microphone, each from a device you pick
@@ -15,7 +15,7 @@ A small, portable screen recorder for Windows, written in Rust. One exe of about
 
 ## Requirements
 
-- Windows 10 version 2004 or newer (program capture uses Windows Graphics Capture)
+- Windows 10 version 2004 or newer
 - A GPU with a hardware H.264 encoder
 
 ## Download

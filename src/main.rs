@@ -51,7 +51,8 @@ use shell::*;
 use hotkeys::{Action, Bindings, Hotkey, label_of};
 use ui::{Element, HEIGHT, View, WIDTH, preview_rect};
 use units::{BitrateUnit, format_amount, TimeUnit, format_bytes, format_duration, format_length, parse_bitrate_input, parse_fps, parse_replay_length};
-use video::{MonitorInfo, Source, fixed_size, monitors, output_size};
+use programs::Program;
+use video::{MonitorInfo, Source, fixed_size, monitor_of, monitors, output_size};
 
 const APP_NAME: &str = "MiniRec";
 const MAIN_CLASS: PCWSTR = w!("MiniRecWindow");
@@ -144,9 +145,15 @@ impl App {
 
     fn source(&self) -> Result<Source> {
         match &self.settings.capture_program {
-            Some(process) => Ok(Source::Program(programs::find(process)?)),
+            Some(process) => self.program_source(programs::find(process)?),
             None => Ok(Source::Monitor(self.monitor()?.clone())),
         }
+    }
+
+    fn program_source(&self, program: Program) -> Result<Source> {
+        let monitor = monitor_of(program.hwnd(), &self.monitors)?;
+
+        Ok(Source::Program(program, monitor))
     }
 
     fn capture_label(&self) -> Result<String> {
@@ -223,7 +230,7 @@ impl App {
         let (note, source) = match programs::running(process)? {
             None => (Some(format!("{process} is not running")), None),
             Some(program) if programs::minimized(&program) => (Some(format!("{process} is minimized")), None),
-            Some(program) => (None, Some(Source::Program(program))),
+            Some(program) => (None, Some(self.program_source(program)?)),
         };
 
         self.program_note = note;
@@ -450,7 +457,7 @@ fn create_and_run() -> Result<()> {
 
         let window = CreateWindowExW(WINDOW_EX_STYLE(0), MAIN_CLASS, w!("MiniRec"), MAIN_STYLE, CW_USEDEFAULT, CW_USEDEFAULT, 800, 800, None, None, Some(instance), None)?;
 
-        dark_title(window)?;
+        prepare_window(window)?;
 
         let preview_window = CreateWindowExW(WINDOW_EX_STYLE(0), VIDEO_CLASS, None, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, Some(window), None, Some(instance), None)?;
         let dpi = GetDpiForWindow(window);
