@@ -103,6 +103,18 @@ struct Trim {
 thread_local! {
     static TRIM: RefCell<Option<Trim>> = const { RefCell::new(None) };
     static REGISTERED: Cell<bool> = const { Cell::new(false) };
+    static STANDALONE: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn open_standalone(video: &Path) -> Result<()> {
+    let folder = video.parent().ok_or_else(|| Error::new(E_FAIL, format!("{} has no folder", video.display())))?;
+
+    STANDALONE.set(true);
+    open(folder)?;
+
+    let window = with_trim(|t| Ok(t.window))?;
+
+    load(window, video.to_path_buf())
 }
 
 pub fn open(folder: &Path) -> Result<()> {
@@ -196,6 +208,10 @@ pub fn close() -> Result<()> {
 
     player.shutdown()?;
     unsafe { DestroyWindow(window)? };
+
+    if STANDALONE.get() {
+        unsafe { PostQuitMessage(0) };
+    }
 
     match export {
         Some(Err(e)) if !is_cancelled(&e) => Err(e),
@@ -553,6 +569,29 @@ impl Trim {
     }
 }
 
+fn load(window: HWND, path: PathBuf) -> Result<()> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or_else(|| Error::new(E_FAIL, "The selected file has no name"))?;
+
+    with_trim(|t| {
+        t.player.open(&path)?;
+        t.scan_id += 1;
+        t.scan = Some((t.scan_id, scan_keyframes(window, path.clone(), t.scan_id)));
+        t.folder = path.parent().map(Path::to_path_buf).ok_or_else(|| Error::new(E_FAIL, "The selected file has no folder"))?;
+        t.file = Some(path);
+        t.duration = 0.0;
+        t.playing = false;
+        t.keyframes = None;
+        t.in_point = None;
+        t.out_point = None;
+        t.segments.clear();
+        t.scroll = 0;
+        t.status = Status::Hint;
+        t.invalidate()
+    })?;
+
+    unsafe { SetWindowTextW(window, &HSTRING::from(format!("MiniRec Trim  ·  {name}"))) }
+}
+
 fn activate(window: HWND, item: Item) -> Result<()> {
     match item {
         Item::Open => {
@@ -560,26 +599,8 @@ fn activate(window: HWND, item: Item) -> Result<()> {
             let Some(path) = pick_video(window, &folder)? else {
                 return Ok(());
             };
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or_else(|| Error::new(E_FAIL, "The selected file has no name"))?;
 
-            with_trim(|t| {
-                t.player.open(&path)?;
-                t.scan_id += 1;
-                t.scan = Some((t.scan_id, scan_keyframes(window, path.clone(), t.scan_id)));
-                t.folder = path.parent().map(Path::to_path_buf).ok_or_else(|| Error::new(E_FAIL, "The selected file has no folder"))?;
-                t.file = Some(path);
-                t.duration = 0.0;
-                t.playing = false;
-                t.keyframes = None;
-                t.in_point = None;
-                t.out_point = None;
-                t.segments.clear();
-                t.scroll = 0;
-                t.status = Status::Hint;
-                t.invalidate()
-            })?;
-
-            unsafe { SetWindowTextW(window, &HSTRING::from(format!("MiniRec Trim  ·  {name}"))) }
+            load(window, path)
         }
         Item::Start(index) | Item::End(index) => {
             let (area, text, scale) = with_trim(|t| {

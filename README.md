@@ -9,7 +9,8 @@ A small, portable screen recorder for Windows, written in Rust. One exe of about
 - Hardware H.264 encoding through Media Foundation (NVIDIA, AMD or Intel)
 - System audio and microphone, each from a device you pick
 - Replay buffer kept in RAM, saved as a clip with a hotkey
-- Trimmer that cuts one or more segments, either lossless or frame-exact
+- Trimmer that cuts one or more segments, either lossless or frame-exact. MiniRec adds itself to Open with for .mp4, .m4v and .mov files as MiniRec Trimmer
+- Sounds when recording or the replay buffer starts and stops, a different pair for each
 - Compressor with a quality mode that estimates the result size, or a target file size mode
 - Rebindable global hotkeys, tray icon and live preview
 - Closing the window keeps MiniRec running hidden with only its hotkeys active, using no CPU and a few MB of RAM. Exit in the tray menu does the same. Run the exe again or press the Show hotkey to bring it back. To stop it completely, end it in Task Manager. Recordings in progress are saved when Windows shuts down. Turn on Start with Windows in the tray menu to have it start hidden when you log in.

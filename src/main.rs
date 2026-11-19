@@ -11,12 +11,14 @@ mod export;
 mod hotkeys;
 mod icon;
 mod keybinds;
+mod openwith;
 mod player;
 mod programs;
 mod recorder;
 mod replay;
 mod settings;
 mod shell;
+mod sound;
 mod startup;
 mod trim;
 mod ui;
@@ -49,6 +51,7 @@ use icon::icon_pixels;
 use recorder::{PreviewSession, Session, Target, WM_PREVIEW_FAILED, WM_SESSION_FAILED, recording_path};
 use settings::{CompressSettings, OUTPUT_HEIGHTS, Settings, bitrate_presets, create_folder, fps_presets};
 use shell::*;
+use sound::Cue;
 use hotkeys::{Action, Bindings, Hotkey, label_of};
 use ui::{Element, HEIGHT, View, WIDTH, preview_rect};
 use units::{BitrateUnit, format_amount, TimeUnit, format_bytes, format_duration, format_length, parse_bitrate_input, parse_fps, parse_replay_length};
@@ -62,13 +65,14 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_SHOW_APP: u32 = WM_APP + 4;
 const WM_CLIP_SAVED: u32 = WM_APP + 5;
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
-const NIN_BALLOONHIDE: u32 = WM_USER + 3;
-const NIN_BALLOONTIMEOUT: u32 = WM_USER + 4;
 const NIN_BALLOONUSERCLICK: u32 = WM_USER + 5;
 const TIMER_ID: usize = 1;
 const START_RETRY_TIMER_ID: usize = 2;
+const BALLOON_TIMER_ID: usize = 3;
+const BALLOON_MS: u32 = 7000;
 const START_RETRY_MS: u32 = 5000;
 const START_RETRIES: u32 = 12;
+const HOTKEY_RESUME_MS: u32 = 100;
 const MENU_SHOW: usize = 1;
 const MENU_TOGGLE: usize = 2;
 const MENU_TRIM: usize = 3;
@@ -410,6 +414,10 @@ fn show_running_instance() -> Result<()> {
 }
 
 fn run() -> Result<()> {
+    if let Some(video) = openwith::video_arg() {
+        return with_media(|| trim_standalone(&video));
+    }
+
     unsafe {
         let mutex = CreateMutexW(None, false, w!("MiniRec.SingleInstance"))?;
 
@@ -419,7 +427,13 @@ fn run() -> Result<()> {
             WAIT_TIMEOUT => return show_running_instance(),
             _ => return Err(Error::from_win32()),
         }
+    }
 
+    with_media(create_and_run)
+}
+
+fn with_media(body: impl FnOnce() -> Result<()>) -> Result<()> {
+    unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
 
@@ -427,39 +441,70 @@ fn run() -> Result<()> {
 
         MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
 
-        let result = create_and_run();
+        let result = body();
 
         MFShutdown()?;
         result
     }
 }
 
-fn create_and_run() -> Result<()> {
+fn trim_standalone(video: &Path) -> Result<()> {
+    register_video_class()?;
+    trim::open_standalone(video)?;
+    message_loop();
+    Ok(())
+}
+
+fn register_video_class() -> Result<()> {
     unsafe {
-        let instance: HINSTANCE = GetModuleHandleW(None)?.into();
-        let arrow = LoadCursorW(None, IDC_ARROW)?;
-        let main_class = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(window_proc),
-            hInstance: instance,
-            hIcon: LoadIconW(Some(instance), APP_ICON)?,
-            hCursor: arrow,
-            lpszClassName: MAIN_CLASS,
-            ..Default::default()
-        };
         let video_class = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(video_proc),
-            hInstance: instance,
-            hCursor: arrow,
+            hInstance: GetModuleHandleW(None)?.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
             hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
             lpszClassName: VIDEO_CLASS,
             ..Default::default()
         };
 
-        if RegisterClassExW(&main_class) == 0 || RegisterClassExW(&video_class) == 0 {
+        if RegisterClassExW(&video_class) == 0 {
             return Err(Error::from_win32());
         }
+
+        Ok(())
+    }
+}
+
+fn message_loop() {
+    let mut message = MSG::default();
+
+    while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
+        unsafe {
+            _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
+fn create_and_run() -> Result<()> {
+    unsafe {
+        let instance: HINSTANCE = GetModuleHandleW(None)?.into();
+        let main_class = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(window_proc),
+            hInstance: instance,
+            hIcon: LoadIconW(Some(instance), APP_ICON)?,
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: MAIN_CLASS,
+            ..Default::default()
+        };
+
+        if RegisterClassExW(&main_class) == 0 {
+            return Err(Error::from_win32());
+        }
+
+        register_video_class()?;
+        openwith::register()?;
 
         let window = CreateWindowExW(WINDOW_EX_STYLE(0), MAIN_CLASS, w!("MiniRec"), MAIN_STYLE, CW_USEDEFAULT, CW_USEDEFAULT, 800, 800, None, None, Some(instance), None)?;
 
@@ -532,13 +577,7 @@ fn create_and_run() -> Result<()> {
             error_box(Some(window), &Error::new(E_FAIL, format!("These shortcuts are used by another app and were not set:\n{}\n\nChange them in Keybinds.", hotkey_failures.join("\n"))));
         }
 
-        let mut message = MSG::default();
-
-        while GetMessageW(&mut message, None, 0, 0).as_bool() {
-            _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-
+        message_loop();
         Ok(())
     }
 }
@@ -676,6 +715,7 @@ fn handle(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Result<
         WM_CLOSE => hide_window(window)?,
         WM_TRAY => on_tray(window, lparam)?,
         WM_HOTKEY => match Action::from_id(wparam.0 as i32) {
+            Some(action) if hotkeys::altgr_held() => with_app(|app| pass_hotkey(app, action))?,
             Some(action) => run_action(window, action)?,
             None => return Ok(None),
         },
@@ -688,6 +728,8 @@ fn handle(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Result<
             }
         })?,
         WM_TIMER if wparam.0 == START_RETRY_TIMER_ID => with_app(retry_start)?,
+        WM_TIMER if wparam.0 == BALLOON_TIMER_ID => with_app(balloon_closed)?,
+        WM_TIMER if Action::from_resume_timer(wparam.0).is_some() => with_app(|app| resume_hotkey(app, wparam.0))?,
         WM_TIMER => with_app(|app| {
             tray_sync(app)?;
             app.invalidate()
@@ -989,10 +1031,14 @@ fn retry_start(app: &mut App) -> Result<()> {
 }
 
 fn toggle(app: &mut App) -> Result<()> {
-    match app.recording {
-        Some(_) => stop_recording(app),
-        None => start_recording(app),
+    if app.recording.is_none() {
+        return start_recording(app);
     }
+
+    let stopped = stop_recording(app);
+
+    sound::play(Cue::RecordStop);
+    stopped
 }
 
 fn start_recording(app: &mut App) -> Result<()> {
@@ -1004,7 +1050,10 @@ fn start_recording(app: &mut App) -> Result<()> {
         return Err(e);
     }
 
-    app.session.as_ref().ok_or_else(|| Error::new(E_FAIL, "Capture did not start"))?.begin_recording(recording_path(&app.settings.folder, ""))?;
+    let session = app.session.as_ref().ok_or_else(|| Error::new(E_FAIL, "Capture did not start"))?;
+
+    sound::play(Cue::RecordStart);
+    session.begin_recording(recording_path(&app.settings.folder, ""))?;
     app.update_timer()?;
     tray_sync(app)?;
     app.invalidate()
@@ -1108,11 +1157,21 @@ fn toggle_replay(app: &mut App) -> Result<()> {
     app.settings.replay = !app.settings.replay;
     app.save_settings()?;
 
+    if app.settings.replay {
+        sound::play(Cue::ReplayOn);
+    }
+
     if let Some(session) = &app.session {
         session.set_replay(app.settings.replay.then_some(app.settings.replay_seconds))?;
     }
 
-    app.sync_session()
+    app.sync_session()?;
+
+    if !app.settings.replay {
+        sound::play(Cue::ReplayOff);
+    }
+
+    Ok(())
 }
 
 fn run_action(window: HWND, action: Action) -> Result<()> {
@@ -1145,6 +1204,33 @@ fn apply_hotkey(action: Action, hotkey: Option<Hotkey>) -> Result<Bindings> {
         tray_sync(app)?;
         Ok(app.settings.hotkeys)
     })
+}
+
+fn pass_hotkey(app: &mut App, action: Action) -> Result<()> {
+    let hotkey = app.registered[action.index()].ok_or_else(|| Error::new(E_FAIL, format!("\"{}\" fired without a registered shortcut", action.label())))?;
+
+    hotkeys::pass_through(app.window, action, hotkey)?;
+    app.registered[action.index()] = None;
+
+    if unsafe { SetTimer(Some(app.window), action.resume_timer(), HOTKEY_RESUME_MS, None) } == 0 {
+        return Err(Error::from_win32());
+    }
+
+    Ok(())
+}
+
+fn resume_hotkey(app: &mut App, timer: usize) -> Result<()> {
+    unsafe { KillTimer(Some(app.window), timer)? };
+
+    let action = Action::from_resume_timer(timer).ok_or_else(|| Error::new(E_FAIL, format!("Unknown shortcut timer {timer}")))?;
+
+    let Some(hotkey) = app.settings.hotkeys[action.index()] else {
+        return Ok(());
+    };
+
+    hotkeys::register_action(app.window, action, hotkey)?;
+    app.registered[action.index()] = Some(hotkey);
+    Ok(())
 }
 
 fn suspend_hotkeys(suspend: bool) -> Result<()> {
@@ -1250,24 +1336,18 @@ fn on_tray(window: HWND, lparam: LPARAM) -> Result<()> {
     match low_word(lparam.0) {
         NIN_SELECT | NIN_KEYSELECT => show_window(window),
         WM_CONTEXTMENU => tray_menu(window),
-        NIN_BALLOONUSERCLICK => {
-            balloon_closed()?;
-
-            match with_app(|app| Ok(app.last_file.clone()))? {
-                Some(path) => reveal(&path),
-                None => Ok(()),
-            }
-        }
-        NIN_BALLOONHIDE | NIN_BALLOONTIMEOUT => balloon_closed(),
+        NIN_BALLOONUSERCLICK => match with_app(|app| Ok(app.last_file.clone()))? {
+            Some(path) => reveal(&path),
+            None => Ok(()),
+        },
         _ => Ok(()),
     }
 }
 
-fn balloon_closed() -> Result<()> {
-    with_app(|app| {
-        app.balloon_open = false;
-        tray_sync(app)
-    })
+fn balloon_closed(app: &mut App) -> Result<()> {
+    unsafe { KillTimer(Some(app.window), BALLOON_TIMER_ID)? };
+    app.balloon_open = false;
+    tray_sync(app)
 }
 
 fn tray_menu(window: HWND) -> Result<()> {
@@ -1409,6 +1489,10 @@ fn tray_update(app: &App) -> Result<()> {
 fn tray_balloon(app: &mut App, title: &str, text: &str) -> Result<()> {
     app.balloon_open = true;
     tray_sync(app)?;
+
+    if unsafe { SetTimer(Some(app.window), BALLOON_TIMER_ID, BALLOON_MS, None) } == 0 {
+        return Err(Error::from_win32());
+    }
 
     let mut data = tray_data(app);
 

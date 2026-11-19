@@ -2,6 +2,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
 const TEST_ID: i32 = 100;
+const RESUME_TIMER_BASE: usize = 16;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Action {
@@ -55,6 +56,14 @@ impl Action {
 
     pub fn from_id(id: i32) -> Option<Action> {
         Self::ALL.into_iter().find(|action| action.id() == id)
+    }
+
+    pub fn resume_timer(self) -> usize {
+        RESUME_TIMER_BASE + self.index()
+    }
+
+    pub fn from_resume_timer(timer: usize) -> Option<Action> {
+        Self::ALL.into_iter().find(|action| action.resume_timer() == timer)
     }
 }
 
@@ -136,13 +145,38 @@ pub fn register(window: HWND, bindings: &Bindings) -> (Bindings, Vec<String>) {
             continue;
         };
 
-        match unsafe { RegisterHotKey(Some(window), action.id(), HOT_KEY_MODIFIERS(hotkey.modifiers) | MOD_NOREPEAT, hotkey.key) } {
+        match register_action(window, action, hotkey) {
             Ok(()) => registered[action.index()] = Some(hotkey),
             Err(_) => failures.push(format!("{} ({})", hotkey.label(), action.label())),
         }
     }
 
     (registered, failures)
+}
+
+pub fn register_action(window: HWND, action: Action, hotkey: Hotkey) -> windows::core::Result<()> {
+    unsafe { RegisterHotKey(Some(window), action.id(), HOT_KEY_MODIFIERS(hotkey.modifiers) | MOD_NOREPEAT, hotkey.key) }
+}
+
+pub fn altgr_held() -> bool {
+    let down = |vk: VIRTUAL_KEY| unsafe { GetAsyncKeyState(vk.0 as i32) } < 0;
+
+    down(VK_RMENU) && !down(VK_LMENU)
+}
+
+pub fn pass_through(window: HWND, action: Action, hotkey: Hotkey) -> windows::core::Result<()> {
+    unsafe { UnregisterHotKey(Some(window), action.id())? };
+
+    let key = |flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type:    INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(hotkey.key as u16), dwFlags: flags, ..Default::default() } },
+    };
+    let inputs = [key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)];
+
+    match unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) } as usize == inputs.len() {
+        true => Ok(()),
+        false => Err(windows::core::Error::from_win32()),
+    }
 }
 
 pub fn unregister(window: HWND, registered: &Bindings) -> windows::core::Result<()> {
