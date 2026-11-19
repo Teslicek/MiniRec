@@ -77,6 +77,7 @@ const MENU_EXIT: usize = 5;
 const MENU_CLIP: usize = 6;
 const MENU_COMPRESS: usize = 7;
 const MENU_STARTUP: usize = 8;
+const MENU_REPLAY: usize = 9;
 const APP_ICON: PCWSTR = PCWSTR(1 as *const u16);
 
 struct Devices {
@@ -133,11 +134,10 @@ struct App {
     preview_failed: bool,
     program_note:   Option<String>,
     show_preview:   Arc<AtomicBool>,
-    tray_icon:      HICON,
+    tray_icons:     Vec<HICON>,
     tray_shown:     bool,
     balloon_open:   bool,
     start_retries:  u32,
-    recording_icon: HICON,
     hand_cursor:    HCURSOR,
     last_file:      Option<PathBuf>,
     canvas:         Canvas,
@@ -477,7 +477,8 @@ fn create_and_run() -> Result<()> {
         let (registered, hotkey_failures) = hotkeys::register(window, &settings.hotkeys);
         TASKBAR_CREATED.set(RegisterWindowMessageW(w!("TaskbarCreated")));
 
-        let tray_size = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+        let tray_size = GetSystemMetricsForDpi(SM_CXSMICON, dpi) as u32;
+        let tray_icons = (0..4).map(|state| create_icon(tray_size, &icon_pixels(tray_size, state & 1 != 0, state & 2 != 0))).collect::<Result<Vec<_>>>()?;
         let app = App {
             window,
             preview_window,
@@ -494,11 +495,10 @@ fn create_and_run() -> Result<()> {
             preview_failed: false,
             program_note: None,
             show_preview: Arc::new(AtomicBool::new(false)),
-            tray_icon: HICON(LoadImageW(Some(instance), APP_ICON, IMAGE_ICON, tray_size, tray_size, LR_DEFAULTCOLOR)?.0),
+            tray_icons,
             tray_shown: false,
             balloon_open: false,
             start_retries: START_RETRIES,
-            recording_icon: create_icon(tray_size as u32, &icon_pixels(tray_size as u32, true))?,
             hand_cursor: LoadCursorW(None, IDC_HAND)?,
             last_file: None,
             canvas: Canvas::new(dpi)?,
@@ -704,6 +704,7 @@ fn handle(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Result<
             }
         })?,
         WM_SHOW_APP => show_window(window)?,
+        WM_ENDSESSION if wparam.0 != 0 => exit(window)?,
         WM_DESTROY => unsafe { PostQuitMessage(0) },
         m if m == TASKBAR_CREATED.get() => with_app(|app| match app.tray_shown {
             true => tray_add(app),
@@ -1266,12 +1267,16 @@ fn balloon_closed() -> Result<()> {
 }
 
 fn tray_menu(window: HWND) -> Result<()> {
-    let (hotkeys, recording) = with_app(|app| Ok((app.settings.hotkeys, app.recording.is_some())))?;
+    let (hotkeys, recording, replay) = with_app(|app| Ok((app.settings.hotkeys, app.recording.is_some(), app.settings.replay)))?;
     let starts_with_windows = startup::enabled()?;
     let shortcut = |action: Action| label_of(&hotkeys, action).map_or(String::new(), |hotkey| format!("\t{hotkey}"));
     let toggle_label = match recording {
         true => format!("Stop recording{}", shortcut(Action::Record)),
         false => format!("Start recording{}", shortcut(Action::Record)),
+    };
+    let replay_label = match replay {
+        true => format!("Stop replay buffer{}", shortcut(Action::Replay)),
+        false => format!("Start replay buffer{}", shortcut(Action::Replay)),
     };
 
     unsafe {
@@ -1280,6 +1285,7 @@ fn tray_menu(window: HWND) -> Result<()> {
 
         AppendMenuW(menu, MF_STRING, MENU_SHOW, w!("Show MiniRec"))?;
         AppendMenuW(menu, MF_STRING, MENU_TOGGLE, &HSTRING::from(toggle_label))?;
+        AppendMenuW(menu, MF_STRING, MENU_REPLAY, &HSTRING::from(replay_label))?;
         AppendMenuW(menu, MF_STRING, MENU_CLIP, &HSTRING::from(format!("Save replay clip{}", shortcut(Action::Clip))))?;
         AppendMenuW(menu, MF_STRING, MENU_TRIM, w!("Trim a video"))?;
         AppendMenuW(menu, MF_STRING, MENU_COMPRESS, w!("Compress a video"))?;
@@ -1298,12 +1304,13 @@ fn tray_menu(window: HWND) -> Result<()> {
             0 => Ok(()),
             MENU_SHOW => show_window(window),
             MENU_TOGGLE => with_app(toggle),
+            MENU_REPLAY => with_app(toggle_replay),
             MENU_CLIP => with_app(save_clip),
             MENU_TRIM => trim::open(&with_app(|app| Ok(app.settings.folder.clone()))?),
             MENU_COMPRESS => open_compressor(),
             MENU_FOLDER => open_folder(&with_app(|app| Ok(app.settings.folder.clone()))?),
             MENU_STARTUP => startup::set(!starts_with_windows),
-            MENU_EXIT => exit(window),
+            MENU_EXIT => hide_window(window),
             id => Err(Error::new(E_FAIL, format!("Unknown menu command {id}"))),
         }
     }
@@ -1332,20 +1339,30 @@ fn tray_data(app: &App) -> NOTIFYICONDATAW {
 }
 
 fn tray_status(app: &App, data: &mut NOTIFYICONDATAW) {
-    let tip = match &app.recording {
-        Some(started) => {
+    let replay = app.settings.replay && app.session.is_some();
+    let replay_note = match label_of(&app.settings.hotkeys, Action::Clip) {
+        Some(hotkey) => format!("Replay buffer on, {hotkey} saves a clip"),
+        None => "Replay buffer on".to_string(),
+    };
+    let tip = match (&app.recording, replay) {
+        (Some(started), _) => {
             let seconds = started.elapsed().as_secs();
+            let elapsed = format!("REC {:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
 
-            format!("{APP_NAME}  REC {:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60)
+            match replay {
+                true => format!("{APP_NAME}  {elapsed}\n{replay_note}"),
+                false => format!("{APP_NAME}  {elapsed}"),
+            }
         }
-        None => match label_of(&app.settings.hotkeys, Action::Record) {
+        (None, true) => format!("{APP_NAME}  {replay_note}"),
+        (None, false) => match label_of(&app.settings.hotkeys, Action::Record) {
             Some(hotkey) => format!("{APP_NAME}  {hotkey} to record"),
             None => APP_NAME.to_string(),
         },
     };
 
     data.uFlags |= NIF_ICON | NIF_TIP | NIF_SHOWTIP;
-    data.hIcon = if app.recording.is_some() { app.recording_icon } else { app.tray_icon };
+    data.hIcon = app.tray_icons[app.recording.is_some() as usize | (replay as usize) << 1];
     copy_wide(&mut data.szTip, &tip);
 }
 

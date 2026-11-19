@@ -77,7 +77,7 @@ fn ico_file() -> Vec<u8> {
 }
 
 fn bmp_image(size: u32) -> Vec<u8> {
-    let pixels = icon_pixels(size, false);
+    let pixels = icon_pixels(size, false, false);
     let mask_row = size.div_ceil(32) * 4;
     let mut image = Vec::new();
 

@@ -12,7 +12,7 @@ A small, portable screen recorder for Windows, written in Rust. One exe of about
 - Trimmer that cuts one or more segments, either lossless or frame-exact
 - Compressor with a quality mode that estimates the result size, or a target file size mode
 - Rebindable global hotkeys, tray icon and live preview
-- Closing the window keeps MiniRec running hidden with only its hotkeys active, using no CPU and a few MB of RAM. Run the exe again or press the Show hotkey to bring it back, and use Exit in the tray menu to quit. Turn on Start with Windows in the tray menu to have it start hidden when you log in.
+- Closing the window keeps MiniRec running hidden with only its hotkeys active, using no CPU and a few MB of RAM. Exit in the tray menu does the same. Run the exe again or press the Show hotkey to bring it back. To stop it completely, end it in Task Manager. Recordings in progress are saved when Windows shuts down. Turn on Start with Windows in the tray menu to have it start hidden when you log in.
 
 ## Requirements
 
