@@ -178,7 +178,17 @@ impl Session {
     }
 
     pub fn set_replay(&self, seconds: Option<u32>) -> Result<()> {
-        *lock(&self.outputs.ring)? = seconds.map(Ring::new);
+        let mut ring = lock(&self.outputs.ring)?;
+
+        match (ring.as_mut(), seconds) {
+            (Some(existing), Some(seconds)) => existing.set_length(seconds),
+            (None, Some(seconds)) => {
+                *ring = Some(Ring::new(seconds));
+                self.outputs.keyframe.store(true, Ordering::Relaxed);
+            }
+            (_, None) => *ring = None,
+        }
+
         Ok(())
     }
 
@@ -186,18 +196,27 @@ impl Session {
         Ok(lock(&self.outputs.ring)?.as_ref().map(Ring::bytes))
     }
 
-    pub fn save_clip(&self, window: HWND, message: u32, path: PathBuf) -> Result<JoinHandle<Result<PathBuf>>> {
-        let clip: Clip = lock(&self.outputs.ring)?.as_ref().ok_or_else(|| Error::new(E_FAIL, "The replay buffer is off"))?.snapshot();
-        let stream = lock(&self.outputs.stream)?.clone().ok_or_else(|| Error::new(E_FAIL, "The replay buffer is still empty. Wait a moment and try again."))?;
+    pub fn save_clip(&self, window: HWND, message: u32, path: PathBuf) -> Result<Option<JoinHandle<Result<PathBuf>>>> {
+        let clip: Clip = {
+            let ring = lock(&self.outputs.ring)?;
+            let ring = ring.as_ref().ok_or_else(|| Error::new(E_FAIL, "The replay buffer is off"))?;
+
+            if ring.is_empty() {
+                return Ok(None);
+            }
+
+            ring.snapshot()
+        };
+        let stream = lock(&self.outputs.stream)?.clone().ok_or_else(|| Error::new(E_FAIL, "Replay buffer has video but no stream format"))?;
         let audio = self.outputs.audio;
         let window = window.0 as isize;
 
-        Ok(std::thread::spawn(move || {
+        Ok(Some(std::thread::spawn(move || {
             let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok().and_then(|_| clip.save(&path, &stream, audio));
 
             unsafe { PostMessageW(Some(HWND(window as *mut _)), message, WPARAM(0), LPARAM(0))? };
             result
-        }))
+        })))
     }
 
     pub fn stop(self) -> Result<()> {

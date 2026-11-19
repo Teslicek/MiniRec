@@ -1079,7 +1079,11 @@ fn save_clip(app: &mut App) -> Result<()> {
     let path = recording_path(&app.settings.folder, "Clip ");
     let session = app.session.as_ref().ok_or_else(|| Error::new(E_FAIL, "The replay buffer is not running"))?;
 
-    app.clip_job = Some(session.save_clip(app.window, WM_CLIP_SAVED, path)?);
+    match session.save_clip(app.window, WM_CLIP_SAVED, path)? {
+        Some(job) => app.clip_job = Some(job),
+        None => return tray_balloon(app, "Replay buffer is starting", "Nothing is buffered yet. Save the clip again in a moment."),
+    }
+
     app.invalidate()
 }
 

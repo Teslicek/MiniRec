@@ -19,20 +19,30 @@ impl Ring {
         Self { length: seconds as i64 * TICKS_PER_SECOND, video: VecDeque::new(), audio: VecDeque::new() }
     }
 
+    pub fn set_length(&mut self, seconds: u32) {
+        self.length = seconds as i64 * TICKS_PER_SECOND;
+    }
+
     pub fn push_video(&mut self, packet: Packet) {
+        if self.video.is_empty() && !packet.keyframe {
+            return;
+        }
+
         let cutoff = packet.time - self.length;
 
         self.video.push_back(packet);
 
-        while self.video.front().is_some_and(|front| front.time < cutoff) {
-            self.video.pop_front();
-        }
-
-        while self.video.len() > 1 && self.video.front().is_some_and(|front| !front.keyframe) {
-            self.video.pop_front();
+        while let Some(next) = self.video.iter().skip(1).position(|p| p.keyframe).map(|index| index + 1)
+            && self.video[next].time <= cutoff
+        {
+            self.video.drain(..next);
         }
 
         self.trim_audio();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.video.is_empty()
     }
 
     pub fn push_audio(&mut self, chunk: AudioChunk) {
@@ -66,10 +76,10 @@ pub struct Clip {
 
 impl Clip {
     pub fn save(self, path: &Path, stream: &StreamType, audio: bool) -> Result<PathBuf> {
-        let first = self.video.first().ok_or_else(|| Error::new(E_FAIL, "The replay buffer is still empty. Wait a moment and try again."))?;
+        let first = self.video.first().ok_or_else(|| Error::new(E_FAIL, "Replay clip has no video"))?;
 
         if !first.keyframe {
-            return Err(Error::new(E_FAIL, "The replay buffer does not start on a keyframe yet. Try again in a second."));
+            return Err(Error::new(E_FAIL, "Replay clip does not start on a keyframe"));
         }
 
         let muxer = Muxer::new(path, stream, audio, first.time)?;
