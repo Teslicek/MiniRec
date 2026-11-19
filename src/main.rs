@@ -66,6 +66,9 @@ const NIN_BALLOONHIDE: u32 = WM_USER + 3;
 const NIN_BALLOONTIMEOUT: u32 = WM_USER + 4;
 const NIN_BALLOONUSERCLICK: u32 = WM_USER + 5;
 const TIMER_ID: usize = 1;
+const START_RETRY_TIMER_ID: usize = 2;
+const START_RETRY_MS: u32 = 5000;
+const START_RETRIES: u32 = 12;
 const MENU_SHOW: usize = 1;
 const MENU_TOGGLE: usize = 2;
 const MENU_TRIM: usize = 3;
@@ -75,7 +78,6 @@ const MENU_CLIP: usize = 6;
 const MENU_COMPRESS: usize = 7;
 const MENU_STARTUP: usize = 8;
 const APP_ICON: PCWSTR = PCWSTR(1 as *const u16);
-const RECORDING_ICON_SIZE: u32 = 32;
 
 struct Devices {
     outputs:        Vec<AudioDevice>,
@@ -134,6 +136,7 @@ struct App {
     tray_icon:      HICON,
     tray_shown:     bool,
     balloon_open:   bool,
+    start_retries:  u32,
     recording_icon: HICON,
     hand_cursor:    HCURSOR,
     last_file:      Option<PathBuf>,
@@ -494,7 +497,8 @@ fn create_and_run() -> Result<()> {
             tray_icon: HICON(LoadImageW(Some(instance), APP_ICON, IMAGE_ICON, tray_size, tray_size, LR_DEFAULTCOLOR)?.0),
             tray_shown: false,
             balloon_open: false,
-            recording_icon: create_icon(RECORDING_ICON_SIZE, &icon_pixels(RECORDING_ICON_SIZE, true))?,
+            start_retries: START_RETRIES,
+            recording_icon: create_icon(tray_size as u32, &icon_pixels(tray_size as u32, true))?,
             hand_cursor: LoadCursorW(None, IDC_HAND)?,
             last_file: None,
             canvas: Canvas::new(dpi)?,
@@ -514,7 +518,11 @@ fn create_and_run() -> Result<()> {
             show_window(window)?;
         }
 
-        with_app(|app| app.sync_session())?;
+        match with_app(|app| app.sync_session()) {
+            Ok(()) => {}
+            Err(_) if background => with_app(|app| schedule_start_retry(app))?,
+            Err(e) => error_box(Some(window), &e),
+        }
 
         if background {
             trim_memory()?;
@@ -679,6 +687,7 @@ fn handle(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Result<
                 false => Ok(()),
             }
         })?,
+        WM_TIMER if wparam.0 == START_RETRY_TIMER_ID => with_app(retry_start)?,
         WM_TIMER => with_app(|app| {
             tray_sync(app)?;
             app.invalidate()
@@ -958,6 +967,24 @@ fn finish_edit(commit: bool) -> Result<()> {
             _ => Ok(()),
         }
     })
+}
+
+fn schedule_start_retry(app: &App) -> Result<()> {
+    if unsafe { SetTimer(Some(app.window), START_RETRY_TIMER_ID, START_RETRY_MS, None) } == 0 {
+        return Err(Error::from_win32());
+    }
+
+    Ok(())
+}
+
+fn retry_start(app: &mut App) -> Result<()> {
+    unsafe { KillTimer(Some(app.window), START_RETRY_TIMER_ID)? };
+    app.start_retries -= 1;
+
+    match app.sync_session() {
+        Err(_) if app.start_retries > 0 => schedule_start_retry(app),
+        result => result,
+    }
 }
 
 fn toggle(app: &mut App) -> Result<()> {
