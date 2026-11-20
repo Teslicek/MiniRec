@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
@@ -10,7 +10,11 @@ const APP_NAME: &str = "MiniRec Trimmer";
 const EXTENSIONS: [&str; 3] = [".mp4", ".m4v", ".mov"];
 
 pub fn video_arg() -> Option<PathBuf> {
-    std::env::args_os().skip(1).map(PathBuf::from).find(|path| path.extension().is_some_and(|ext| EXTENSIONS.iter().any(|known| ext.eq_ignore_ascii_case(&known[1..]))))
+    std::env::args_os().skip(1).map(PathBuf::from).find(|path| is_video(path))
+}
+
+pub fn is_video(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| EXTENSIONS.iter().any(|known| ext.eq_ignore_ascii_case(&known[1..])))
 }
 
 pub fn register() -> Result<()> {

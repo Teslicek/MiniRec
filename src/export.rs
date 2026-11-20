@@ -17,7 +17,6 @@ use crate::encoder::{RateControl, device_manager, encoder_parameters, video_type
 use crate::units::{format_bytes, format_time};
 
 pub const WM_EXPORT_DONE: u32 = WM_APP + 31;
-pub const WM_KEYFRAMES_DONE: u32 = WM_APP + 32;
 pub const WM_ESTIMATE_DONE: u32 = WM_APP + 33;
 
 const PROGRESS_SCALE: u32 = 1000;
@@ -140,38 +139,44 @@ pub fn is_cancelled(error: &Error) -> bool {
     error.code() == E_ABORT
 }
 
-pub struct Scan {
-    pub keyframes: Vec<i64>,
-    pub frames:    u64,
+pub struct Keyframes {
+    reader: IMFSourceReader,
+    video:  u32,
 }
 
-pub fn scan_keyframes(window: HWND, source: PathBuf, id: usize) -> JoinHandle<Result<Scan>> {
-    background(window, WM_KEYFRAMES_DONE, id, move || unsafe {
-        let reader = MFCreateSourceReaderFromURL(&HSTRING::from(source.as_os_str()), None)?;
-        let streams = Streams::find(&reader)?;
-        let mut scan = Scan { keyframes: Vec::new(), frames: 0 };
+impl Keyframes {
+    pub fn open(source: &Path) -> Result<Self> {
+        unsafe {
+            let reader = MFCreateSourceReaderFromURL(&HSTRING::from(source.as_os_str()), None)?;
+            let streams = Streams::find(&reader)?;
 
-        reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
-        reader.SetStreamSelection(streams.video, true)?;
+            reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
+            reader.SetStreamSelection(streams.video, true)?;
+            Ok(Self { reader, video: streams.video })
+        }
+    }
+
+    pub fn before(&self, time: i64) -> Result<i64> {
+        seek(&self.reader, time)?;
 
         loop {
-            let read = read_sample(&reader, streams.video)?;
+            let read = read_sample(&self.reader, self.video)?;
 
             if read.end_of_stream {
-                return Ok(scan);
+                return Err(Error::new(E_FAIL, format!("There is no video frame at {}", format_time(time as f64 / TICKS))));
             }
 
             let Some(sample) = read.sample else {
                 continue;
             };
 
-            scan.frames += 1;
-
-            if sample.GetUINT32(&MFSampleExtension_CleanPoint).is_ok_and(|clean| clean != 0) {
-                scan.keyframes.push(read.time);
+            if !unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.is_ok_and(|clean| clean != 0) {
+                return Err(Error::new(E_FAIL, format!("Seeking to {} did not land on a keyframe", format_time(time as f64 / TICKS))));
             }
+
+            return Ok(read.time);
         }
-    })
+    }
 }
 
 pub fn probe(source: &Path) -> Result<Probe> {
@@ -185,13 +190,6 @@ pub fn probe(source: &Path) -> Result<Probe> {
         };
 
         Ok(Probe { seconds: duration(&reader)? as f64 / 10_000_000.0, video_bitrate: source_bitrate(&reader, &native)?, audio_bitrate })
-    }
-}
-
-pub fn snap(keyframes: &[i64], time: i64) -> i64 {
-    match keyframes.partition_point(|&k| k <= time) {
-        0 => time,
-        index => keyframes[index - 1],
     }
 }
 
@@ -235,7 +233,13 @@ impl Task<'_> {
     }
 
     fn fit(&mut self, bytes: u64) -> Result<()> {
-        let bitrate = probe(self.source)?.fit_bitrate(bytes)?;
+        let mut probe = probe(self.source)?;
+
+        if !self.segments.is_empty() {
+            probe.seconds = self.segments.iter().map(|&(start, end)| end - start).sum::<i64>() as f64 / TICKS;
+        }
+
+        let bitrate = probe.fit_bitrate(bytes)?;
 
         self.transcode(Some(MFVideoFormat_H264), RateControl::Bitrate(bitrate))?;
 
@@ -478,7 +482,7 @@ fn duration(reader: &IMFSourceReader) -> Result<i64> {
     }
 }
 
-fn hardware_device() -> Result<ID3D11Device> {
+pub fn hardware_device() -> Result<ID3D11Device> {
     unsafe {
         let mut device: Option<ID3D11Device> = None;
 

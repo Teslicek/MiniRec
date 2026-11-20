@@ -1,11 +1,17 @@
 use std::path::Path;
 
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Graphics::DirectComposition::{DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 use windows::core::{BSTR, Error, Interface, Result};
 use windows_core::implement;
+
+use crate::encoder::device_manager;
+use crate::export::hardware_device;
 
 pub const WM_PLAYER_EVENT: u32 = WM_APP + 30;
 
@@ -29,8 +35,11 @@ pub enum PlayerEvent {
 }
 
 pub struct Player {
-    engine: IMFMediaEngine,
-    extra:  IMFMediaEngineEx,
+    engine:      IMFMediaEngine,
+    extra:       IMFMediaEngineEx,
+    composition: IDCompositionDevice,
+    visual:      IDCompositionVisual,
+    _target:     IDCompositionTarget,
 }
 
 impl Player {
@@ -39,18 +48,28 @@ impl Player {
             let factory: IMFMediaEngineClassFactory = CoCreateInstance(&CLSID_MFMediaEngineClassFactory, None, CLSCTX_INPROC_SERVER)?;
             let mut attributes = None;
 
-            MFCreateAttributes(&mut attributes, 2)?;
+            MFCreateAttributes(&mut attributes, 3)?;
 
-            let attributes = attributes.ok_or_else(|| Error::new(windows::Win32::Foundation::E_FAIL, "MFCreateAttributes returned no attributes"))?;
+            let attributes = attributes.ok_or_else(|| Error::new(E_FAIL, "MFCreateAttributes returned no attributes"))?;
             let notify: IMFMediaEngineNotify = Notify { window: events.0 as isize }.into();
+            let device = hardware_device()?;
 
             attributes.SetUnknown(&MF_MEDIA_ENGINE_CALLBACK, &notify)?;
-            attributes.SetUINT64(&MF_MEDIA_ENGINE_PLAYBACK_HWND, video.0 as u64)?;
+            attributes.SetUnknown(&MF_MEDIA_ENGINE_DXGI_MANAGER, &device_manager(&device)?)?;
+            attributes.SetUINT32(&MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM.0 as u32)?;
 
             let engine = factory.CreateInstance(0, &attributes)?;
-            let extra = engine.cast()?;
+            let extra: IMFMediaEngineEx = engine.cast()?;
 
-            Ok(Self { engine, extra })
+            extra.EnableWindowlessSwapchainMode(true)?;
+
+            let composition: IDCompositionDevice = DCompositionCreateDevice(&device.cast::<IDXGIDevice>()?)?;
+            let target = composition.CreateTargetForHwnd(video, true)?;
+            let visual = composition.CreateVisual()?;
+
+            target.SetRoot(&visual)?;
+            composition.Commit()?;
+            Ok(Self { engine, extra, composition, visual, _target: target })
         }
     }
 
@@ -78,6 +97,36 @@ impl Player {
         let mode = if exact { MF_MEDIA_ENGINE_SEEK_MODE_NORMAL } else { MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE };
 
         unsafe { self.extra.SetCurrentTimeEx(seconds, mode) }
+    }
+
+    pub fn attach(&self) -> Result<()> {
+        unsafe {
+            let surface = self.composition.CreateSurfaceFromHandle(self.extra.GetVideoSwapchainHandle()?)?;
+
+            self.visual.SetContent(&surface)?;
+            self.composition.Commit()
+        }
+    }
+
+    pub fn set_volume(&self, volume: f64) -> Result<()> {
+        unsafe { self.engine.SetVolume(volume) }
+    }
+
+    pub fn set_muted(&self, muted: bool) -> Result<()> {
+        unsafe { self.engine.SetMuted(muted) }
+    }
+
+    pub fn set_rate(&self, rate: f64) -> Result<()> {
+        unsafe {
+            self.engine.SetDefaultPlaybackRate(rate)?;
+            self.engine.SetPlaybackRate(rate)
+        }
+    }
+
+    pub fn resize(&self, area: RECT) -> Result<()> {
+        let target = RECT { left: 0, top: 0, right: area.right - area.left, bottom: area.bottom - area.top };
+
+        unsafe { self.extra.UpdateVideoStream(None, Some(&target), None) }
     }
 
     pub fn step(&self, forward: bool) -> Result<()> {

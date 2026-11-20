@@ -6,8 +6,8 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
-use windows::core::{Result, w};
-use windows_numerics::Vector2;
+use windows::core::{PCWSTR, Result, w};
+use windows_numerics::{Matrix3x2, Vector2};
 
 pub const BACKGROUND: u32 = 0x0f1012;
 pub const BLACK: u32 = 0x000000;
@@ -42,6 +42,7 @@ pub struct Fonts {
     pub button:       IDWriteTextFormat,
     pub small:        IDWriteTextFormat,
     pub small_center: IDWriteTextFormat,
+    pub icon:         IDWriteTextFormat,
 }
 
 pub struct Canvas {
@@ -61,13 +62,14 @@ impl Canvas {
                 factory,
                 target: RefCell::new(None),
                 fonts: Fonts {
-                    large: text_format(&dwrite, 26.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING)?,
-                    body: text_format(&dwrite, 13.5, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING)?,
-                    body_right: text_format(&dwrite, 13.5, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
-                    field: text_format(&dwrite, FIELD_FONT_SIZE, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
-                    button: text_format(&dwrite, 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)?,
-                    small: text_format(&dwrite, 11.5, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING)?,
-                    small_center: text_format(&dwrite, 11.5, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER)?,
+                    large: text_format(&dwrite, w!("Segoe UI"), 26.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+                    body: text_format(&dwrite, w!("Segoe UI"), 13.5, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+                    body_right: text_format(&dwrite, w!("Segoe UI"), 13.5, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
+                    field: text_format(&dwrite, w!("Segoe UI"), FIELD_FONT_SIZE, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
+                    button: text_format(&dwrite, w!("Segoe UI"), 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)?,
+                    small: text_format(&dwrite, w!("Segoe UI"), 11.5, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+                    small_center: text_format(&dwrite, w!("Segoe UI"), 11.5, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER)?,
+                    icon: text_format(&dwrite, w!("Segoe MDL2 Assets"), 16.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER)?,
                 },
                 dpi: Cell::new(dpi),
             })
@@ -164,6 +166,10 @@ impl Painter<'_> {
         unsafe { self.target.Clear(Some(&color(hex))) };
     }
 
+    pub fn translate(&self, x: f32, y: f32) {
+        unsafe { self.target.SetTransform(&Matrix3x2::translation(x, y)) };
+    }
+
     pub fn round(&self, r: D2D_RECT_F, radius: f32, hex: u32) {
         unsafe {
             self.brush.SetColor(&color(hex));
@@ -197,6 +203,14 @@ impl Painter<'_> {
     pub fn button(&self, r: D2D_RECT_F, label: &str, enabled: bool, hovered: bool) {
         self.round(r, 6.0, if enabled && hovered { BUTTON_HOVER } else { BUTTON });
         self.text(label, &self.fonts.button, r, if enabled { TEXT } else { DIM });
+    }
+
+    pub fn icon_button(&self, r: D2D_RECT_F, glyph: &str, hovered: bool) {
+        if hovered {
+            self.round(r, 6.0, BUTTON_HOVER);
+        }
+
+        self.text(glyph, &self.fonts.icon, r, TEXT);
     }
 
     pub fn dropdown(&self, r: D2D_RECT_F, value: &str, active: bool, hovered: bool) {
@@ -275,9 +289,9 @@ fn color(hex: u32) -> D2D1_COLOR_F {
     }
 }
 
-fn text_format(dwrite: &IDWriteFactory, size: f32, weight: DWRITE_FONT_WEIGHT, alignment: DWRITE_TEXT_ALIGNMENT) -> Result<IDWriteTextFormat> {
+fn text_format(dwrite: &IDWriteFactory, family: PCWSTR, size: f32, weight: DWRITE_FONT_WEIGHT, alignment: DWRITE_TEXT_ALIGNMENT) -> Result<IDWriteTextFormat> {
     unsafe {
-        let format = dwrite.CreateTextFormat(w!("Segoe UI"), None, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, w!("en-us"))?;
+        let format = dwrite.CreateTextFormat(family, None, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, w!("en-us"))?;
         let ellipsis = dwrite.CreateEllipsisTrimmingSign(&format)?;
         let trimming = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
 

@@ -20,6 +20,9 @@ pub const OUTPUT_HEIGHTS: [u32; 5] = [2160, 1440, 1080, 720, 480];
 const DEFAULT_REPLAY_SECONDS: u32 = 120;
 pub const QUALITY_PRESETS: [(&str, u32); 3] = [("Small", 40), ("Balanced", 50), ("High", 60)];
 pub const SIZE_PRESETS: [u64; 5] = [10 << 20, 25 << 20, 50 << 20, 100 << 20, 500 << 20];
+const COMPRESS_PREFIX: &str = "compress_";
+const PLAYER_PREFIX: &str = "player_";
+const SHARED_PREFIXES: [&str; 2] = [COMPRESS_PREFIX, PLAYER_PREFIX];
 
 #[derive(Clone, Copy)]
 pub struct CompressSettings {
@@ -27,6 +30,113 @@ pub struct CompressSettings {
     pub quality:  u32,
     pub size:     u64,
     pub replace:  bool,
+}
+
+impl CompressSettings {
+    pub fn load() -> Result<Self> {
+        let mut choices = Self { fit_size: false, quality: QUALITY_PRESETS[1].1, size: SIZE_PRESETS[1], replace: false };
+
+        read_shared(COMPRESS_PREFIX, |key, value| {
+            match key {
+                "compress_fit_size" => choices.fit_size = parse_bool(value)?,
+                "compress_quality" => choices.quality = parse_quality(value).ok()?,
+                "compress_size" => choices.size = value.parse().ok().filter(|bytes| (MIN_SIZE..=MAX_SIZE).contains(bytes))?,
+                "compress_replace" => choices.replace = parse_bool(value)?,
+                _ => return None,
+            }
+
+            Some(())
+        })?;
+        Ok(choices)
+    }
+
+    pub fn save(self) -> Result<()> {
+        write_shared(COMPRESS_PREFIX, &format!("compress_fit_size={}\ncompress_quality={}\ncompress_size={}\ncompress_replace={}\n", self.fit_size, self.quality, self.size, self.replace))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct PlayerSettings {
+    pub volume:    f64,
+    pub muted:     bool,
+    pub window:    Option<[i32; 4]>,
+    pub maximized: bool,
+}
+
+impl PlayerSettings {
+    pub fn load() -> Result<Self> {
+        let mut player = Self { volume: 1.0, muted: false, window: None, maximized: false };
+
+        read_shared(PLAYER_PREFIX, |key, value| {
+            match key {
+                "player_volume" => player.volume = value.parse().ok().filter(|volume| (0.0..=1.0).contains(volume))?,
+                "player_muted" => player.muted = parse_bool(value)?,
+                "player_window" => {
+                    let parts: Vec<i32> = value.split(',').map(|part| part.trim().parse().ok()).collect::<Option<_>>()?;
+
+                    player.window = Some(parts.try_into().ok()?);
+                }
+                "player_maximized" => player.maximized = parse_bool(value)?,
+                _ => return None,
+            }
+
+            Some(())
+        })?;
+        Ok(player)
+    }
+
+    pub fn save(self) -> Result<()> {
+        let window = self.window.map(|[left, top, right, bottom]| format!("player_window={left},{top},{right},{bottom}\n"));
+
+        write_shared(PLAYER_PREFIX, &format!("player_volume={}\nplayer_muted={}\nplayer_maximized={}\n{}", self.volume, self.muted, self.maximized, window.as_deref().map_or("", |line| line)))
+    }
+}
+
+fn read_shared(prefix: &str, mut apply: impl FnMut(&str, &str) -> Option<()>) -> Result<()> {
+    let path = settings_path()?;
+
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let text = fs::read_to_string(&path).map_err(|e| file_error("read", &path, e))?;
+
+    for (index, line) in text.lines().enumerate() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+
+        if !key.starts_with(prefix) {
+            continue;
+        }
+
+        apply(key, value.trim()).ok_or_else(|| Error::new(E_FAIL, format!("Invalid line {} in {}:\n{line}", index + 1, path.display())))?;
+    }
+
+    Ok(())
+}
+
+fn write_shared(prefix: &str, lines: &str) -> Result<()> {
+    let path = settings_path()?;
+    let kept = settings_lines(&path, |line| !line.trim_start().starts_with(prefix))?;
+
+    fs::write(&path, kept + lines).map_err(|e| file_error("write", &path, e))
+}
+
+fn shared_lines() -> Result<String> {
+    settings_lines(&settings_path()?, is_shared)
+}
+
+fn settings_lines(path: &Path, keep: impl Fn(&str) -> bool) -> Result<String> {
+    match path.exists() {
+        true => Ok(fs::read_to_string(path).map_err(|e| file_error("read", path, e))?.lines().filter(|line| keep(line)).map(|line| format!("{line}\n")).collect()),
+        false => Ok(String::new()),
+    }
+}
+
+fn is_shared(line: &str) -> bool {
+    SHARED_PREFIXES.iter().any(|prefix| line.trim_start().starts_with(prefix))
 }
 
 pub struct Settings {
@@ -44,7 +154,6 @@ pub struct Settings {
     pub replay:            bool,
     pub replay_seconds:    u32,
     pub replay_unit:       TimeUnit,
-    pub compress:          CompressSettings,
     pub hotkeys:           Bindings,
     pub folder:            PathBuf,
 }
@@ -67,7 +176,6 @@ impl Settings {
             replay: false,
             replay_seconds: DEFAULT_REPLAY_SECONDS,
             replay_unit: TimeUnit::Seconds,
-            compress: CompressSettings { fit_size: false, quality: QUALITY_PRESETS[1].1, size: SIZE_PRESETS[1], replace: false },
             hotkeys: DEFAULT_BINDINGS,
             folder: default_folder()?,
         };
@@ -115,10 +223,7 @@ impl Settings {
                 "replay" => settings.replay = parse_bool(value).ok_or_else(invalid)?,
                 "replay_seconds" => settings.replay_seconds = value.parse().ok().and_then(|seconds| check_replay_seconds(seconds).ok()).ok_or_else(invalid)?,
                 "replay_unit" => settings.replay_unit = TimeUnit::parse(value).ok_or_else(invalid)?,
-                "compress_fit_size" => settings.compress.fit_size = parse_bool(value).ok_or_else(invalid)?,
-                "compress_quality" => settings.compress.quality = parse_quality(value).map_err(|_| invalid())?,
-                "compress_size" => settings.compress.size = value.parse().ok().filter(|bytes| (MIN_SIZE..=MAX_SIZE).contains(bytes)).ok_or_else(invalid)?,
-                "compress_replace" => settings.compress.replace = parse_bool(value).ok_or_else(invalid)?,
+                key if is_shared(key) => {}
                 "folder" if !value.is_empty() => settings.folder = PathBuf::from(value),
                 _ => return Err(invalid()),
             }
@@ -130,7 +235,7 @@ impl Settings {
     pub fn save(&self) -> Result<()> {
         let path = settings_path()?;
         let text = format!(
-            "monitor={}\ncapture_program={}\noutput={}\nfps={}\nbitrate={}b\nbitrate_unit={}\nsystem_audio={}\nsystem_device={}\nmicrophone={}\nmicrophone_device={}\ncursor={}\nreplay={}\nreplay_seconds={}\nreplay_unit={}\ncompress_fit_size={}\ncompress_quality={}\ncompress_size={}\ncompress_replace={}\nfolder={}\n",
+            "monitor={}\ncapture_program={}\noutput={}\nfps={}\nbitrate={}b\nbitrate_unit={}\nsystem_audio={}\nsystem_device={}\nmicrophone={}\nmicrophone_device={}\ncursor={}\nreplay={}\nreplay_seconds={}\nreplay_unit={}\nfolder={}\n",
             self.monitor,
             self.capture_program.as_deref().map_or(UNBOUND, |process| process),
             self.output.map_or(SOURCE_OUTPUT.to_string(), |height| height.to_string()),
@@ -145,16 +250,12 @@ impl Settings {
             self.replay,
             self.replay_seconds,
             self.replay_unit.label(),
-            self.compress.fit_size,
-            self.compress.quality,
-            self.compress.size,
-            self.compress.replace,
             self.folder.display(),
         );
 
         let hotkeys: String = Action::ALL.iter().map(|&action| format!("{}={}\n", action.key(), self.hotkeys[action.index()].map_or(UNBOUND.to_string(), Hotkey::encode))).collect();
 
-        fs::write(&path, text + &hotkeys).map_err(|e| file_error("write", &path, e))
+        fs::write(&path, text + &hotkeys + &shared_lines()?).map_err(|e| file_error("write", &path, e))
     }
 
     pub fn system_source(&self) -> Option<Option<String>> {

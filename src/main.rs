@@ -583,7 +583,10 @@ fn create_and_run() -> Result<()> {
 }
 
 extern "system" fn video_proc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    unsafe { DefWindowProcW(window, message, wparam, lparam) }
+    match message {
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+        _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+    }
 }
 
 extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1044,9 +1047,11 @@ fn toggle(app: &mut App) -> Result<()> {
 fn start_recording(app: &mut App) -> Result<()> {
     create_folder(&app.settings.folder)?;
     app.recording = Some(Instant::now());
+    tray_sync(app)?;
 
     if let Err(e) = app.ensure_session() {
         app.recording = None;
+        tray_sync(app)?;
         return Err(e);
     }
 
@@ -1068,13 +1073,8 @@ fn stop_recording(app: &mut App) -> Result<()> {
 
     app.invalidate()?;
 
-    match &saved {
-        Ok(Some(path)) => {
-            app.last_file = Some(path.clone());
-            tray_balloon(app, "Recording saved", &format!("{}\nClick to show in folder.", file_name(path)?))?;
-        }
-        Ok(None) => tray_balloon(app, "Nothing recorded", "The recording was stopped before its first frame was ready.")?,
-        Err(_) => {}
+    if let Ok(Some(path)) = &saved {
+        app.last_file = Some(path.clone());
     }
 
     app.sync_session()?;
@@ -1158,6 +1158,7 @@ fn toggle_replay(app: &mut App) -> Result<()> {
     app.save_settings()?;
 
     if app.settings.replay {
+        tray_sync(app)?;
         sound::play(Cue::ReplayOn);
     }
 
@@ -1254,16 +1255,9 @@ fn suspend_hotkeys(suspend: bool) -> Result<()> {
 }
 
 fn open_compressor() -> Result<()> {
-    let (folder, choices) = with_app(|app| Ok((app.settings.folder.clone(), app.settings.compress)))?;
+    let folder = with_app(|app| Ok(app.settings.folder.clone()))?;
 
-    compress::open(&folder, choices, remember_compression)
-}
-
-fn remember_compression(choices: CompressSettings) -> Result<()> {
-    with_app(|app| {
-        app.settings.compress = choices;
-        app.settings.save()
-    })
+    compress::open(&folder, CompressSettings::load()?, CompressSettings::save)
 }
 
 fn show_window(window: HWND) -> Result<()> {
@@ -1287,7 +1281,11 @@ fn hide_window(window: HWND) -> Result<()> {
         app.hover = None;
         app.sync_preview()?;
         app.canvas.release();
-        tray_sync(app)
+
+        match app.balloon_open {
+            true => balloon_closed(app),
+            false => tray_sync(app),
+        }
     })
 }
 
@@ -1423,7 +1421,7 @@ fn tray_data(app: &App) -> NOTIFYICONDATAW {
 }
 
 fn tray_status(app: &App, data: &mut NOTIFYICONDATAW) {
-    let replay = app.settings.replay && app.session.is_some();
+    let replay = app.settings.replay;
     let replay_note = match label_of(&app.settings.hotkeys, Action::Clip) {
         Some(hotkey) => format!("Replay buffer on, {hotkey} saves a clip"),
         None => "Replay buffer on".to_string(),
@@ -1452,7 +1450,7 @@ fn tray_status(app: &App, data: &mut NOTIFYICONDATAW) {
 
 fn tray_sync(app: &mut App) -> Result<()> {
     let visible = unsafe { IsWindowVisible(app.window).as_bool() };
-    let wanted = visible || app.session.is_some() || app.clip_job.is_some() || app.balloon_open;
+    let wanted = visible || app.recording.is_some() || app.settings.replay || app.session.is_some() || app.clip_job.is_some() || app.balloon_open;
 
     match (wanted, app.tray_shown) {
         (true, false) => tray_add(app)?,
