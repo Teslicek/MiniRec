@@ -4,6 +4,7 @@ use windows::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT, SND_SY
 use windows::core::PCWSTR;
 
 const SAMPLE_RATE: u32 = 44100;
+const LEAD_IN_SECONDS: f32 = 0.2;
 const NOTE_SECONDS: f32 = 0.085;
 const LAST_NOTE_SECONDS: f32 = 0.2;
 const ATTACK_SECONDS: f32 = 0.004;
@@ -36,21 +37,19 @@ pub fn play(cue: Cue) {
 }
 
 fn wave(notes: &[f32]) -> Vec<u8> {
-    let samples: Vec<i16> = notes
-        .iter()
-        .enumerate()
-        .flat_map(|(index, &frequency)| {
-            let seconds = if index + 1 == notes.len() { LAST_NOTE_SECONDS } else { NOTE_SECONDS };
-            let count = (seconds * SAMPLE_RATE as f32) as u32;
+    let lead_in = (LEAD_IN_SECONDS * SAMPLE_RATE as f32) as usize;
+    let tones = notes.iter().enumerate().flat_map(|(index, &frequency)| {
+        let seconds = if index + 1 == notes.len() { LAST_NOTE_SECONDS } else { NOTE_SECONDS };
+        let count = (seconds * SAMPLE_RATE as f32) as u32;
 
-            (0..count).map(move |sample| {
-                let time = sample as f32 / SAMPLE_RATE as f32;
-                let envelope = (time / ATTACK_SECONDS).min(1.0) * (-time * DECAY_PER_SECOND).exp() * (1.0 - sample as f32 / count as f32);
+        (0..count).map(move |sample| {
+            let time = sample as f32 / SAMPLE_RATE as f32;
+            let envelope = (time / ATTACK_SECONDS).min(1.0) * (-time * DECAY_PER_SECOND).exp() * (1.0 - sample as f32 / count as f32);
 
-                ((TAU * frequency * time).sin() * envelope * VOLUME * i16::MAX as f32) as i16
-            })
+            ((TAU * frequency * time).sin() * envelope * VOLUME * i16::MAX as f32) as i16
         })
-        .collect();
+    });
+    let samples: Vec<i16> = std::iter::repeat_n(0, lead_in).chain(tones).collect();
     let data = (samples.len() * 2) as u32;
     let mut bytes = Vec::with_capacity(44 + data as usize);
 
