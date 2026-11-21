@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
-use windows::Win32::Graphics::Gdi::{ClientToScreen, DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
+use windows::Win32::Graphics::Gdi::{ClientToScreen, DEVMODEW, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS, EnumDisplayDevicesW, EnumDisplaySettingsW};
 use windows::Win32::System::Threading::*;
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
@@ -19,7 +19,7 @@ use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, IsIconic, IsWindow};
+use windows::Win32::UI::WindowsAndMessaging::{EDD_GET_DEVICE_INTERFACE_NAME, GetClientRect, GetWindowRect, IsIconic, IsWindow};
 use windows::core::{Error, HSTRING, Interface, Result};
 
 use crate::cursor::CursorOverlay;
@@ -35,6 +35,7 @@ const STARVED_SECONDS: i64 = 2;
 pub struct MonitorInfo {
     pub adapter: u32,
     pub output:  u32,
+    pub id:      String,
     pub name:    String,
     pub width:   u32,
     pub height:  u32,
@@ -79,9 +80,22 @@ pub fn monitors() -> Result<Vec<MonitorInfo>> {
                 return Err(Error::new(E_FAIL, format!("Cannot read the refresh rate of {device}")));
             }
 
+            let mut display = DISPLAY_DEVICEW { cb: size_of::<DISPLAY_DEVICEW>() as u32, ..Default::default() };
+
+            if !unsafe { EnumDisplayDevicesW(&HSTRING::from(&device), 0, &mut display, EDD_GET_DEVICE_INTERFACE_NAME) }.as_bool() {
+                return Err(Error::new(E_FAIL, format!("Cannot identify the monitor on {device}")));
+            }
+
+            let id = String::from_utf16_lossy(&display.DeviceID).trim_end_matches('\0').to_string();
+
+            if id.is_empty() {
+                return Err(Error::new(E_FAIL, format!("The monitor on {device} has no device ID")));
+            }
+
             list.push(MonitorInfo {
                 adapter: adapter_index,
                 output: output_index,
+                id,
                 name: device.trim_start_matches(r"\\.\").to_string(),
                 width: (rect.right - rect.left) as u32,
                 height: (rect.bottom - rect.top) as u32,

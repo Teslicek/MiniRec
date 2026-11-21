@@ -153,7 +153,10 @@ struct App {
 
 impl App {
     fn monitor(&self) -> Result<&MonitorInfo> {
-        find_monitor(&self.monitors, &self.settings.monitor)
+        match self.monitors.iter().find(|monitor| monitor.id == self.settings.monitor) {
+            Some(monitor) => Ok(monitor),
+            None => primary_monitor(&self.monitors),
+        }
     }
 
     fn source(&self) -> Result<Source> {
@@ -257,12 +260,6 @@ impl App {
 
     fn refresh_monitors(&mut self) -> Result<()> {
         self.monitors = monitors()?;
-
-        if self.monitor().is_err() {
-            self.settings.monitor = primary_monitor(&self.monitors)?.name.clone();
-            self.save_settings()?;
-        }
-
         Ok(())
     }
 
@@ -513,11 +510,7 @@ fn create_and_run() -> Result<()> {
         let preview_window = CreateWindowExW(WINDOW_EX_STYLE(0), VIDEO_CLASS, None, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, Some(window), None, Some(instance), None)?;
         let dpi = GetDpiForWindow(window);
         let monitors = monitors()?;
-        let mut settings = Settings::load(primary_monitor(&monitors)?)?;
-
-        if find_monitor(&monitors, &settings.monitor).is_err() {
-            settings.monitor = primary_monitor(&monitors)?.name.clone();
-        }
+        let settings = Settings::load(primary_monitor(&monitors)?)?;
 
         let (registered, hotkey_failures) = hotkeys::register(window, &settings.hotkeys);
         TASKBAR_CREATED.set(RegisterWindowMessageW(w!("TaskbarCreated")));
@@ -788,7 +781,7 @@ fn activate(window: HWND, element: Element) -> Result<()> {
                 let programs = programs::list()?;
                 let selected: Vec<usize> = match &app.settings.capture_program {
                     Some(process) => programs.iter().position(|p| p.process.eq_ignore_ascii_case(process)).map(|i| i + app.monitors.len() + 1).into_iter().collect(),
-                    None => app.monitors.iter().position(|m| m.name == app.settings.monitor).into_iter().collect(),
+                    None => app.monitors.iter().position(|m| m.id == app.settings.monitor).into_iter().collect(),
                 };
                 let labels: Vec<String> = app.monitors.iter().map(MonitorInfo::label).chain(std::iter::once(String::new())).chain(programs.iter().map(|p| p.label())).collect();
 
@@ -803,7 +796,7 @@ fn activate(window: HWND, element: Element) -> Result<()> {
                     Some(program) => app.settings.capture_program = Some(programs[program].process.clone()),
                     None => {
                         app.settings.capture_program = None;
-                        app.settings.monitor = app.monitors[index].name.clone();
+                        app.settings.monitor = app.monitors[index].id.clone();
                     }
                 }
 
@@ -1401,10 +1394,6 @@ fn tray_menu(window: HWND) -> Result<()> {
 fn open_folder(folder: &Path) -> Result<()> {
     create_folder(folder)?;
     shell_open(&HSTRING::from(folder.as_os_str()), PCWSTR::null())
-}
-
-fn find_monitor<'a>(monitors: &'a [MonitorInfo], name: &str) -> Result<&'a MonitorInfo> {
-    monitors.iter().find(|m| m.name == name).ok_or_else(|| Error::new(E_FAIL, format!("Monitor {name} is not connected")))
 }
 
 fn primary_monitor(monitors: &[MonitorInfo]) -> Result<&MonitorInfo> {

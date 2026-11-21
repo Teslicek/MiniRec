@@ -162,7 +162,7 @@ impl Settings {
     pub fn load(default_monitor: &MonitorInfo) -> Result<Self> {
         let path = settings_path()?;
         let mut settings = Self {
-            monitor: default_monitor.name.clone(),
+            monitor: default_monitor.id.clone(),
             capture_program: None,
             output: None,
             fps: DEFAULT_FPS,
