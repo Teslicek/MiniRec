@@ -3,6 +3,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
 const TEST_ID: i32 = 100;
 const RESUME_TIMER_BASE: usize = 16;
+const STANDALONE_KEYS: [VIRTUAL_KEY; 6] = [VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_INSERT, VK_SCROLL];
+const EXTENDED_KEYS: [VIRTUAL_KEY; 10] = [VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_INSERT, VK_DELETE, VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN];
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Action {
@@ -101,7 +103,7 @@ impl Hotkey {
     }
 
     pub fn is_safe(self) -> bool {
-        self.modifiers & (MOD_CONTROL.0 | MOD_ALT.0) != 0 || (VK_F1.0 as u32..=VK_F24.0 as u32).contains(&self.key)
+        self.modifiers & (MOD_CONTROL.0 | MOD_ALT.0) != 0 || (VK_F1.0 as u32..=VK_F24.0 as u32).contains(&self.key) || is_one_of(&STANDALONE_KEYS, self.key)
     }
 
     pub fn label(self) -> String {
@@ -196,7 +198,7 @@ pub fn label_of(bindings: &Bindings, action: Action) -> Option<String> {
 fn key_name(key: u32) -> String {
     unsafe {
         let scan = MapVirtualKeyW(key, MAPVK_VK_TO_VSC_EX);
-        let extended = if scan & 0xff00 == 0xe000 { 1 << 24 } else { 0 };
+        let extended = if scan & 0xff00 == 0xe000 || is_one_of(&EXTENDED_KEYS, key) { 1 << 24 } else { 0 };
         let mut buffer = [0u16; 64];
         let length = GetKeyNameTextW((((scan & 0xff) << 16) | extended) as i32, &mut buffer);
 
@@ -205,6 +207,10 @@ fn key_name(key: u32) -> String {
             n => String::from_utf16_lossy(&buffer[..n as usize]),
         }
     }
+}
+
+fn is_one_of(keys: &[VIRTUAL_KEY], key: u32) -> bool {
+    keys.iter().any(|vk| vk.0 as u32 == key)
 }
 
 fn capitalize(name: &str) -> String {

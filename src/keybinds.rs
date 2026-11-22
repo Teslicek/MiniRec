@@ -162,7 +162,7 @@ fn handle(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Result<
 
             if !hotkey.is_safe() {
                 stop_capture()?;
-                return Err(Error::new(E_INVALIDARG, format!("{} would block normal typing. Use Ctrl or Alt with a key, or an F-key.", hotkey.label())));
+                return Err(Error::new(E_INVALIDARG, format!("{} would block normal typing. Use Ctrl or Alt with a key, an F-key, Page Up, Page Down, Home, End, Insert or Scroll Lock.", hotkey.label())));
             }
 
             let available = hotkey.available(window);
