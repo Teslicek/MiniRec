@@ -18,6 +18,7 @@ mod recorder;
 mod replay;
 mod settings;
 mod shell;
+mod snip;
 mod sound;
 mod startup;
 mod trim;
@@ -566,6 +567,10 @@ fn create_and_run() -> Result<()> {
             trim_memory()?;
         }
 
+        if let Err(e) = snip::hook(window) {
+            error_box(Some(window), &e);
+        }
+
         if !hotkey_failures.is_empty() {
             error_box(Some(window), &Error::new(E_FAIL, format!("These shortcuts are used by another app and were not set:\n{}\n\nChange them in Keybinds.", hotkey_failures.join("\n"))));
         }
@@ -742,6 +747,7 @@ fn handle(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Result<
             }
         })?,
         WM_SHOW_APP => show_window(window)?,
+        snip::WM_SNIP => take_screenshot()?,
         WM_ENDSESSION if wparam.0 != 0 => exit(window)?,
         WM_DESTROY => unsafe { PostQuitMessage(0) },
         m if m == TASKBAR_CREATED.get() => with_app(|app| match app.tray_shown {
@@ -1051,7 +1057,7 @@ fn start_recording(app: &mut App) -> Result<()> {
     let session = app.session.as_ref().ok_or_else(|| Error::new(E_FAIL, "Capture did not start"))?;
 
     sound::play(Cue::RecordStart);
-    session.begin_recording(recording_path(&app.settings.folder, ""))?;
+    session.begin_recording(recording_path(&app.settings.folder, "", "mp4"))?;
     app.update_timer()?;
     tray_sync(app)?;
     app.invalidate()
@@ -1118,7 +1124,7 @@ fn save_clip(app: &mut App) -> Result<()> {
 
     create_folder(&app.settings.folder)?;
 
-    let path = recording_path(&app.settings.folder, "Clip ");
+    let path = recording_path(&app.settings.folder, "Clip ", "mp4");
     let session = app.session.as_ref().ok_or_else(|| Error::new(E_FAIL, "The replay buffer is not running"))?;
 
     match session.save_clip(app.window, WM_CLIP_SAVED, path)? {
@@ -1176,7 +1182,12 @@ fn run_action(window: HWND, action: Action) -> Result<()> {
         Action::Show => show_window(window),
         Action::Trim => trim::open(&with_app(|app| Ok(app.settings.folder.clone()))?),
         Action::Compress => open_compressor(),
+        Action::Screenshot => take_screenshot(),
     }
+}
+
+fn take_screenshot() -> Result<()> {
+    snip::open(&with_app(|app| Ok(app.settings.folder.clone()))?)
 }
 
 fn open_keybinds() -> Result<()> {
@@ -1230,7 +1241,7 @@ fn resume_hotkey(app: &mut App, timer: usize) -> Result<()> {
 fn suspend_hotkeys(suspend: bool) -> Result<()> {
     with_app(|app| {
         hotkeys::unregister(app.window, &app.registered)?;
-        app.registered = [None; 6];
+        app.registered = [None; Action::ALL.len()];
 
         if suspend {
             return Ok(());

@@ -259,10 +259,10 @@ impl PreviewSession {
     }
 }
 
-pub fn recording_path(folder: &Path, prefix: &str) -> PathBuf {
+pub fn recording_path(folder: &Path, prefix: &str, extension: &str) -> PathBuf {
     let t = unsafe { GetLocalTime() };
 
-    folder.join(format!("{prefix}{:04}-{:02}-{:02} {:02}-{:02}-{:02}.mp4", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond))
+    folder.join(format!("{prefix}{:04}-{:02}-{:02} {:02}-{:02}-{:02}.{extension}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond))
 }
 
 pub fn in_mta<T: Send>(work: impl FnOnce() -> Result<T> + Send) -> Result<T> {

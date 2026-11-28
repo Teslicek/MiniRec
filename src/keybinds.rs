@@ -16,7 +16,7 @@ use crate::shell::{WM_MOUSELEAVE, dark_title, error_box, fit_client, high_word, 
 const CLASS: PCWSTR = w!("MiniRecKeybinds");
 const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0);
 const WIDTH: f32 = 520.0;
-const HEIGHT: f32 = 392.0;
+const HEIGHT: f32 = 444.0;
 const FIRST_ROW: f32 = 64.0;
 const ROW_STEP: f32 = 52.0;
 const ROW_HEIGHT: f32 = 44.0;
@@ -162,7 +162,7 @@ fn handle(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Result<
 
             if !hotkey.is_safe() {
                 stop_capture()?;
-                return Err(Error::new(E_INVALIDARG, format!("{} would block normal typing. Use Ctrl or Alt with a key, an F-key, Page Up, Page Down, Home, End, Insert or Scroll Lock.", hotkey.label())));
+                return Err(Error::new(E_INVALIDARG, format!("{} would block normal typing. Use Ctrl or Alt with a key, an F-key, Print Screen, Page Up, Page Down, Home, End, Insert or Scroll Lock.", hotkey.label())));
             }
 
             let available = hotkey.available(window);

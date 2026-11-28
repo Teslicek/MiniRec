@@ -41,6 +41,7 @@ pub struct MonitorInfo {
     pub height:  u32,
     pub refresh: u32,
     pub primary: bool,
+    pub bounds:  RECT,
 }
 
 impl MonitorInfo {
@@ -101,6 +102,7 @@ pub fn monitors() -> Result<Vec<MonitorInfo>> {
                 height: (rect.bottom - rect.top) as u32,
                 refresh: mode.dmDisplayFrequency,
                 primary: rect.left == 0 && rect.top == 0,
+                bounds: rect,
             });
         }
     }
@@ -416,7 +418,7 @@ impl VideoCapture {
     }
 }
 
-unsafe fn create_device(adapter: Option<&IDXGIAdapter1>) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+pub unsafe fn create_device(adapter: Option<&IDXGIAdapter1>) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     unsafe {
         let mut device = None;
         let mut context = None;

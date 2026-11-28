@@ -1,9 +1,9 @@
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{E_ACCESSDENIED, HWND};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
 const TEST_ID: i32 = 100;
 const RESUME_TIMER_BASE: usize = 16;
-const STANDALONE_KEYS: [VIRTUAL_KEY; 6] = [VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_INSERT, VK_SCROLL];
+const STANDALONE_KEYS: [VIRTUAL_KEY; 7] = [VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_INSERT, VK_SCROLL, VK_SNAPSHOT];
 const EXTENDED_KEYS: [VIRTUAL_KEY; 10] = [VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_INSERT, VK_DELETE, VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -14,10 +14,11 @@ pub enum Action {
     Show,
     Trim,
     Compress,
+    Screenshot,
 }
 
 impl Action {
-    pub const ALL: [Action; 6] = [Action::Record, Action::Clip, Action::Replay, Action::Show, Action::Trim, Action::Compress];
+    pub const ALL: [Action; 7] = [Action::Record, Action::Clip, Action::Replay, Action::Show, Action::Trim, Action::Compress, Action::Screenshot];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -27,6 +28,7 @@ impl Action {
             Action::Show => "Show MiniRec",
             Action::Trim => "Open trimmer",
             Action::Compress => "Open compressor",
+            Action::Screenshot => "Take screenshot",
         }
     }
 
@@ -38,6 +40,7 @@ impl Action {
             Action::Show => "hotkey_show",
             Action::Trim => "hotkey_trim",
             Action::Compress => "hotkey_compress",
+            Action::Screenshot => "hotkey_screenshot",
         }
     }
 
@@ -49,6 +52,7 @@ impl Action {
             Action::Show => 3,
             Action::Trim => 4,
             Action::Compress => 5,
+            Action::Screenshot => 6,
         }
     }
 
@@ -75,11 +79,12 @@ pub struct Hotkey {
     pub key:       u32,
 }
 
-pub type Bindings = [Option<Hotkey>; 6];
+pub type Bindings = [Option<Hotkey>; Action::ALL.len()];
 
 pub const DEFAULT_BINDINGS: Bindings = [
     Some(Hotkey { modifiers: MOD_CONTROL.0 | MOD_ALT.0, key: b'R' as u32 }),
     Some(Hotkey { modifiers: MOD_CONTROL.0 | MOD_ALT.0, key: b'S' as u32 }),
+    None,
     None,
     None,
     None,
@@ -139,7 +144,7 @@ impl Hotkey {
 }
 
 pub fn register(window: HWND, bindings: &Bindings) -> (Bindings, Vec<String>) {
-    let mut registered: Bindings = [None; 6];
+    let mut registered: Bindings = [None; Action::ALL.len()];
     let mut failures = Vec::new();
 
     for action in Action::ALL {
@@ -175,10 +180,12 @@ pub fn pass_through(window: HWND, action: Action, hotkey: Hotkey) -> windows::co
     };
     let inputs = [key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)];
 
-    match unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) } as usize == inputs.len() {
-        true => Ok(()),
-        false => Err(windows::core::Error::from_win32()),
+    if unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) } as usize == inputs.len() {
+        return Ok(());
     }
+
+    register_action(window, action, hotkey)?;
+    Err(windows::core::Error::new(E_ACCESSDENIED, format!("Windows blocked MiniRec from typing AltGr+{} into the active window, for example because that program runs as administrator.", key_name(hotkey.key))))
 }
 
 pub fn unregister(window: HWND, registered: &Bindings) -> windows::core::Result<()> {
